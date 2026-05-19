@@ -16,7 +16,7 @@ This tool consumes WebRTC media from a WHEP endpoint and re-streams it as SRT, e
 - **WHEP Input**: Consumes WebRTC streams via the WHEP protocol
 - **SRT Output**: Outputs to SRT with configurable parameters
 - **Audio Processing**: Automatically handles audio decoding, conversion, and AAC encoding
-- **Video Bridging**: Optional VP8/VP9/H.264/H.265/AV1 → H.264 transcoding into the SRT output (enable with `--bridge-video`)
+- **Video Bridging**: Optional video bridging into the SRT output (enable with `--bridge-video`).  H.264 sources are passed through without re-encoding; VP8/VP9/H.265/AV1 are transcoded to H.264.
 - **Multi-track Support**: Handles multiple audio tracks via audio mixing (liveadder)
 - **Continuous Output**: Silent audio source ensures continuous stream even without input
 - **Docker Support**: Ready-to-use Docker image with all dependencies included
@@ -88,10 +88,10 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 | `-o, --output-url` | | SRT output stream URL | `srt://0.0.0.0:1234?mode=listener` |
 | `--auth-token` | `WHEP_SRT_AUTH_TOKEN` | Authorization token for WHEP endpoint | - |
 | `--latency` | `WHEP_SRT_JITTERBUFFER_LATENCY` | Jitterbuffer latency in ms (sets rtpbin latency and liveadder min-upstream-latency) | `200` |
-| `--bridge-video` | | Transcode incoming video tracks to H.264 and include them in the SRT output | `false` |
-| `--video-bitrate` | `WHEP_SRT_VIDEO_BITRATE` | x264enc target bitrate in kbps (only used with `--bridge-video`) | `8000` |
-| `--video-preset` | `WHEP_SRT_VIDEO_PRESET` | x264enc speed-preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better quality at same bitrate, more CPU. | `fast` |
-| `--video-key-int` | `WHEP_SRT_VIDEO_KEY_INT` | x264enc max keyframe interval in frames. Smaller = faster initial sync for new viewers, worse compression efficiency. | `60` |
+| `--bridge-video` | | Bridge incoming video tracks into the SRT output (H.264 passthrough, otherwise transcode to H.264) | `false` |
+| `--video-bitrate` | `WHEP_SRT_VIDEO_BITRATE` | x264enc target bitrate in kbps (only used when transcoding) | `8000` |
+| `--video-preset` | `WHEP_SRT_VIDEO_PRESET` | x264enc speed-preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better quality at same bitrate, more CPU. (only used when transcoding) | `fast` |
+| `--video-key-int` | `WHEP_SRT_VIDEO_KEY_INT` | x264enc max keyframe interval in frames. Smaller = faster initial sync for new viewers, worse compression efficiency. (only used when transcoding) | `60` |
 | `--dot-debug` | | Output debug .dot files of the pipeline | `false` |
 
 ### Examples
@@ -150,11 +150,12 @@ The application dynamically constructs a GStreamer pipeline that:
    - Adds a silent audio test source to ensure continuous output
    - Encodes to AAC using `avenc_aac`
 4. **Video Processing Chain** (when `--bridge-video` is set):
-   - Decodes the first incoming video track using `decodebin` (supports VP8, VP9, H.264, H.265, AV1)
-   - Re-encodes to H.264 using `x264enc` with `tune=zerolatency` and `speed-preset=ultrafast`
+   - If the first incoming video track is **H.264**, it is passed through without re-encoding via `rtph264depay` → `h264parse` (`config-interval=-1` injects SPS/PPS inline before every IDR) → `mpegtsmux`
+   - Otherwise (VP8, VP9, H.265, AV1) the track is decoded by `decodebin` and re-encoded to H.264 by `x264enc`
    - Additional video tracks (e.g. simulcast layers) are discarded to `fakesink`
 5. **Output Chain**:
    - Muxes audio (and optionally video) into MPEG-TS using `mpegtsmux`
+   - When video is bridged, a buffer probe on the output queue strips `mpegtsmux`'s HDMV registration descriptor from the PMT so FFmpeg ≥ 8 subscribers don't fall into HDMV mode (which requires an AVCDecoderConfigurationRecord this pipeline doesn't produce)
    - Sends to SRT destination via `srtsink`
 
 **Pipeline String (when using whepsrc):**
@@ -197,12 +198,11 @@ Toggle between them by changing the `whepsrc` boolean variable in the code. Note
 - OPUS (default, 48kHz)
 
 **Video Input (via RTP, when `--bridge-video` is set):**
-- VP8, VP9, H.264, H.265, AV1 (decoded by `decodebin`, re-encoded to H.264)
+- H.264 (passed through without re-encoding)
+- VP8, VP9, H.265, AV1 (decoded by `decodebin`, re-encoded to H.264)
 
 **Video Output:**
-- H.264 (Constrained Baseline, `tune=zerolatency`, `speed-preset=ultrafast`)
-
-> **Note:** Video is always re-encoded to H.264 regardless of input codec. H.264 passthrough (skipping decode+encode) is not yet supported.
+- H.264 — passthrough copy of the source bitstream when the input is H.264, otherwise produced by `x264enc` (`tune=zerolatency`, configurable preset / bitrate / GOP)
 
 ## Development
 
@@ -250,8 +250,8 @@ xdot 1729000000-error.dot
 
 ## Known Issues & Limitations
 
-- **Video re-encode only**: Video is always transcoded to H.264. H.264 passthrough (skipping decode+encode when the source is already H.264) is not yet implemented.
 - **Single video track**: Only the first video track is bridged; additional tracks are discarded.
+- **Initial PMT advertises audio only**: The video chain attaches to `mpegtsmux` dynamically once the WHEP source delivers a video pad, so the streamheader PAT/PMT cached by SRT relays at startup advertises audio only.  Direct SRT subscribers re-read the PMT on each new section and pick up the video stream when it appears.
 
 ## Troubleshooting
 
@@ -268,10 +268,6 @@ Check your firewall settings and ensure the SRT port (default 1234/udp) is acces
 
 **No audio output:**
 Enable debug logging to see if audio pads are being created and linked correctly.
-
-## Future Improvements
-
-- [ ] H.264 passthrough when the incoming WebRTC stream is already H.264 (skip decode+encode)
 
 ## License
 

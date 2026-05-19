@@ -3,7 +3,7 @@ use env_logger::Env;
 use log::{self, error, info};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
@@ -89,8 +89,9 @@ fn main() {
     info!("SRT output at {output_url}");
     if bridge_video {
         info!(
-            "video bridging enabled: x264 preset={video_preset}, bitrate={video_bitrate} kbps, \
-             key-int-max={video_key_int}, tune=zerolatency"
+            "video bridging enabled: H.264 passthrough when source is H.264, \
+             otherwise transcode via x264 (preset={video_preset}, bitrate={video_bitrate} kbps, \
+             key-int-max={video_key_int}, tune=zerolatency)"
         );
     }
     info!("---");
@@ -133,7 +134,7 @@ fn main() {
     // limitation than to ship a stream that hangs.
     let pipeline_str = format!(
         "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
-        mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
+        mpegtsmux name=mux alignment=7 ! queue name=srt_queue ! srtsink name=srt_sink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
     );
 
     let mut context = gst::ParseContext::new();
@@ -164,6 +165,91 @@ fn main() {
         .expect("could not find mixer element");
     mixer.set_property_from_str("min-upstream-latency", &format!("{latency}000000"));
     let mixer_clone = mixer.clone();
+
+    if bridge_video {
+        // PMT-patcher buffer probe.  mpegtsmux always writes an HDMV registration descriptor for
+        // H.264 streams.  Without an accompanying AVCDecoderConfigurationRecord (which mpegtsmux
+        // only adds when input is AVC, not byte-stream), FFmpeg >= 8 enters HDMV mode and refuses
+        // to read inline SPS/PPS — subscribers fail with "non-existing PPS 0 referenced".  Patch
+        // the PMT in flight on srt_queue.src: zero out the "HDMV" identifier and recompute the
+        // section CRC.  The probe must handle both Buffer and BufferList because `queue`
+        // aggregates buffers into BufferLists when downstream (srtsink) supports them.
+        let srt_queue = pipeline
+            .by_name("srt_queue")
+            .expect("could not find srt_queue element");
+        let pmt_patcher = Mutex::new(PmtPatcher::new());
+        srt_queue
+            .static_pad("src")
+            .expect("srt_queue has no src pad")
+            .add_probe(
+                PadProbeType::BUFFER | PadProbeType::BUFFER_LIST,
+                move |_pad, probe_info| {
+                    let mut patcher = pmt_patcher.lock().unwrap();
+                    match probe_info.data {
+                        Some(gst::PadProbeData::Buffer(ref mut buf)) => {
+                            let buf_mut = buf.make_mut();
+                            if let Ok(mut map) = buf_mut.map_writable() {
+                                patcher.process(map.as_mut_slice());
+                            }
+                        }
+                        Some(gst::PadProbeData::BufferList(ref mut list)) => {
+                            let list_mut = list.make_mut();
+                            for i in 0..list_mut.len() {
+                                if let Some(buf) = list_mut.get_mut(i) {
+                                    if let Ok(mut map) = buf.map_writable() {
+                                        patcher.process(map.as_mut_slice());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+
+        // Keyframe-on-subscribe.  When a new SRT subscriber connects, ask the WHEP source for a
+        // fresh IDR so the subscriber has a decode entry point.  Without this, browser/WebRTC
+        // encoders typically only emit an IDR at the start of the stream — anyone connecting
+        // later sees nothing but P-frames and decode fails.  The force-key-unit upstream event
+        // propagates queue → h264parse → depay → webrtcbin, which translates it to an RTCP PLI
+        // on the peer connection.
+        //
+        // We fire the event as a small burst (0/500/1500 ms) rather than once, for two reasons:
+        // some WebRTC senders rate-limit PLIs and ignore the second of two close together, and
+        // the rtpjitterbuffer (with drop-on-latency=true) may discard the resulting IDR if it
+        // arrives during a skew reset.  Spreading the requests across ~1.5 s gives at least one
+        // a good chance of producing an IDR that survives all the way to the subscriber.
+        let srt_sink = pipeline
+            .by_name("srt_sink")
+            .expect("could not find srt_sink element");
+        let pipeline_for_keyframe = pipeline.clone();
+        srt_sink.connect("caller-added", false, move |_values| {
+            info!("SRT subscriber connected — sending PLI burst");
+            let pipeline_for_thread = pipeline_for_keyframe.clone();
+            std::thread::spawn(move || {
+                for (idx, &delay_ms) in [0u64, 500, 1500].iter().enumerate() {
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    match pipeline_for_thread.by_name("video_queue") {
+                        Some(video_queue) => {
+                            let s = gst::Structure::builder("GstForceKeyUnit")
+                                .field("all-headers", true)
+                                .build();
+                            let sent = video_queue
+                                .send_event(gst::event::CustomUpstream::new(s));
+                            info!("PLI burst {idx} (+{delay_ms}ms): sent={sent}");
+                        }
+                        None => {
+                            info!("PLI burst {idx} (+{delay_ms}ms): no video chain yet");
+                        }
+                    }
+                }
+            });
+            None
+        });
+    }
 
     // Guard: only the first arriving video pad is bridged; additional video tracks go to fakesink.
     let video_bridged = Arc::new(AtomicBool::new(false));
@@ -386,46 +472,32 @@ fn main() {
                         let encoding_name = structure
                             .get::<String>("encoding-name")
                             .unwrap_or_default();
-                        info!("bridging {encoding_name} video track to SRT output (transcode to H.264)");
 
                         let pipe_bin = pipeline_clone
                             .dynamic_cast_ref::<gst::Bin>()
                             .expect("could not cast pipeline to bin");
 
-                        let decodebin = ElementFactory::make("decodebin")
-                            .build()
-                            .expect("could not create video decodebin");
-                        pipe_bin
-                            .add(&decodebin)
-                            .expect("could not add video decodebin to pipeline");
-                        decodebin
-                            .sync_state_with_parent()
-                            .expect("could not sync video decodebin state");
+                        if encoding_name.eq_ignore_ascii_case("H264") {
+                            info!("bridging H.264 video track to SRT output (passthrough — no transcode)");
 
-                        // Clone references for the decodebin pad-added closure.
-                        // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
-                        let pipe_bin_clone = pipe_bin.clone();
-                        let pipeline_for_mux = pipeline_clone.clone();
-                        let video_preset = video_preset.clone();
-
-                        decodebin.connect_pad_added(move |_elem, src_pad| {
-                            info!("video decodebin src pad added: '{}'", src_pad.name());
-
-                            // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
-                            // tune=zerolatency: no B-frames / no lookahead — required for live.
-                            // bframes=0 and CABAC are already correct via tune=zerolatency.
-                            // speed-preset / bitrate / key-int-max are tunable via CLI flags;
-                            // see Args for env var names and defaults.
-                            let videoconvert = ElementFactory::make("videoconvert")
+                            // rtph264depay → capsfilter(stream-format=avc) → h264parse →
+                            // capsfilter(byte-stream) → queue → mpegtsmux.
+                            // Forcing stream-format=avc on depay's src caps makes it populate
+                            // codec_data with the SDP sprop-parameter-sets; h264parse with
+                            // config-interval=-1 then injects those SPS/PPS inline ahead of
+                            // every IDR when converting to byte-stream — without this the
+                            // depay drops sprop-parameter-sets and most NALs come through as
+                            // "short NAL" warnings.
+                            let depay = ElementFactory::make("rtph264depay")
                                 .build()
-                                .expect("could not create videoconvert");
-                            let x264enc = ElementFactory::make("x264enc")
+                                .expect("could not create rtph264depay");
+                            let depay_avc_caps = ElementFactory::make("capsfilter")
                                 .build()
-                                .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
-                            x264enc.set_property_from_str("tune", "zerolatency");
-                            x264enc.set_property_from_str("speed-preset", &video_preset);
-                            x264enc.set_property_from_str("bitrate", &video_bitrate.to_string());
-                            x264enc.set_property_from_str("key-int-max", &video_key_int.to_string());
+                                .expect("could not create depay AVC capsfilter");
+                            depay_avc_caps.set_property_from_str(
+                                "caps",
+                                "video/x-h264,stream-format=avc,alignment=au",
+                            );
                             let h264parse = ElementFactory::make("h264parse")
                                 .build()
                                 .expect("could not create h264parse");
@@ -438,21 +510,72 @@ fn main() {
                                 "video/x-h264,stream-format=byte-stream,alignment=au",
                             );
                             let queue = ElementFactory::make("queue")
+                                .name("video_queue")
                                 .build()
                                 .expect("could not create video queue");
 
-                            let elements = [&videoconvert, &x264enc, &h264parse, &stream_caps, &queue];
-                            pipe_bin_clone
+                            let elements = [&depay, &depay_avc_caps, &h264parse, &stream_caps, &queue];
+                            pipe_bin
                                 .add_many(elements)
-                                .expect("could not add video encode elements to pipeline");
+                                .expect("could not add H.264 passthrough elements to pipeline");
                             for elem in elements {
                                 elem.sync_state_with_parent()
-                                    .expect("could not sync video encode element state");
+                                    .expect("could not sync H.264 passthrough element state");
                             }
                             gst::Element::link_many(elements)
-                                .expect("could not link video encode chain");
+                                .expect("could not link H.264 passthrough chain");
 
-                            let mux = pipeline_for_mux
+                            // The WHEP rtpjitterbuffer periodically resets its skew estimation
+                            // (visible in logs as "delta - skew … too big, reset skew") and the
+                            // immediately-surrounding buffers come out of rtph264depay with
+                            // PTS=NONE.  mpegtsmux then drops them with "Buffer has no timestamp"
+                            // — which on the wire shows up as dropped P-frames and visible
+                            // blockiness even when the source bitrate is fine.  Stamp those
+                            // buffers with the previous buffer's PTS plus a 1 ms tick — that
+                            // keeps timestamps monotonic and local to the surrounding sequence
+                            // (using wall-clock running time produced non-monotonic DTS that
+                            // ffmpeg then had to "replace by guess").  Constrained Baseline has
+                            // no B-frames so DTS == PTS.
+                            let stamper_target = queue.clone();
+                            let last_pts: Mutex<Option<gst::ClockTime>> = Mutex::new(None);
+                            let stamper_warned = AtomicBool::new(false);
+                            h264parse
+                                .static_pad("src")
+                                .unwrap()
+                                .add_probe(PadProbeType::BUFFER, move |_pad, info| {
+                                    if let Some(gst::PadProbeData::Buffer(ref mut buf)) = info.data
+                                    {
+                                        let mut last = last_pts.lock().unwrap();
+                                        match buf.pts() {
+                                            Some(pts) => *last = Some(pts),
+                                            None => {
+                                                let stamp = last
+                                                    .map(|p| p + gst::ClockTime::from_mseconds(1))
+                                                    .or_else(|| {
+                                                        stamper_target.current_running_time()
+                                                    });
+                                                if let Some(stamp) = stamp {
+                                                    let buf_mut = buf.make_mut();
+                                                    buf_mut.set_pts(Some(stamp));
+                                                    if buf_mut.dts().is_none() {
+                                                        buf_mut.set_dts(Some(stamp));
+                                                    }
+                                                    *last = Some(stamp);
+                                                    if !stamper_warned
+                                                        .swap(true, Ordering::Relaxed)
+                                                    {
+                                                        info!(
+                                                            "video chain: stamping PTS=NONE buffers (jitterbuffer skew artefact)"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    gst::PadProbeReturn::Ok
+                                });
+
+                            let mux = pipeline_clone
                                 .by_name("mux")
                                 .expect("could not find mpegtsmux");
                             let h264_caps = gst::Caps::builder("video/x-h264").build();
@@ -475,18 +598,108 @@ fn main() {
                                 .link(&mux_video_pad)
                                 .expect("could not link video queue src to mpegtsmux");
 
-                            src_pad
-                                .link(&videoconvert.static_pad("sink").unwrap())
-                                .expect("could not link video decodebin src to videoconvert");
-                        });
+                            pad.link(&depay.static_pad("sink").unwrap())
+                                .expect("could not link video whep pad to rtph264depay");
+                        } else {
+                            info!("bridging {encoding_name} video track to SRT output (transcode to H.264)");
 
-                        let decodebin_sink = decodebin
-                            .sink_pads()
-                            .into_iter()
-                            .next()
-                            .expect("video decodebin has no sink pad");
-                        pad.link(&decodebin_sink)
-                            .expect("could not link video whep pad to video decodebin");
+                            let decodebin = ElementFactory::make("decodebin")
+                                .build()
+                                .expect("could not create video decodebin");
+                            pipe_bin
+                                .add(&decodebin)
+                                .expect("could not add video decodebin to pipeline");
+                            decodebin
+                                .sync_state_with_parent()
+                                .expect("could not sync video decodebin state");
+
+                            // Clone references for the decodebin pad-added closure.
+                            // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
+                            let pipe_bin_clone = pipe_bin.clone();
+                            let pipeline_for_mux = pipeline_clone.clone();
+                            let video_preset = video_preset.clone();
+
+                            decodebin.connect_pad_added(move |_elem, src_pad| {
+                                info!("video decodebin src pad added: '{}'", src_pad.name());
+
+                                // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
+                                // tune=zerolatency: no B-frames / no lookahead — required for live.
+                                // bframes=0 and CABAC are already correct via tune=zerolatency.
+                                // speed-preset / bitrate / key-int-max are tunable via CLI flags;
+                                // see Args for env var names and defaults.
+                                let videoconvert = ElementFactory::make("videoconvert")
+                                    .build()
+                                    .expect("could not create videoconvert");
+                                let x264enc = ElementFactory::make("x264enc")
+                                    .build()
+                                    .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
+                                x264enc.set_property_from_str("tune", "zerolatency");
+                                x264enc.set_property_from_str("speed-preset", &video_preset);
+                                x264enc.set_property_from_str("bitrate", &video_bitrate.to_string());
+                                x264enc.set_property_from_str("key-int-max", &video_key_int.to_string());
+                                let h264parse = ElementFactory::make("h264parse")
+                                    .build()
+                                    .expect("could not create h264parse");
+                                h264parse.set_property_from_str("config-interval", "-1");
+                                let stream_caps = ElementFactory::make("capsfilter")
+                                    .build()
+                                    .expect("could not create h264 stream capsfilter");
+                                stream_caps.set_property_from_str(
+                                    "caps",
+                                    "video/x-h264,stream-format=byte-stream,alignment=au",
+                                );
+                                let queue = ElementFactory::make("queue")
+                                    .name("video_queue")
+                                    .build()
+                                    .expect("could not create video queue");
+
+                                let elements = [&videoconvert, &x264enc, &h264parse, &stream_caps, &queue];
+                                pipe_bin_clone
+                                    .add_many(elements)
+                                    .expect("could not add video encode elements to pipeline");
+                                for elem in elements {
+                                    elem.sync_state_with_parent()
+                                        .expect("could not sync video encode element state");
+                                }
+                                gst::Element::link_many(elements)
+                                    .expect("could not link video encode chain");
+
+                                let mux = pipeline_for_mux
+                                    .by_name("mux")
+                                    .expect("could not find mpegtsmux");
+                                let h264_caps = gst::Caps::builder("video/x-h264").build();
+                                let mux_video_pad = mux
+                                    .pad_template_list()
+                                    .into_iter()
+                                    .find(|t| {
+                                        t.direction() == gst::PadDirection::Sink
+                                            && t.presence() == gst::PadPresence::Request
+                                            && t.caps().can_intersect(&h264_caps)
+                                    })
+                                    .inspect(|t| {
+                                        info!("requesting mpegtsmux video pad via template '{}'", t.name_template());
+                                    })
+                                    .and_then(|t| mux.request_pad(&t, None, None))
+                                    .expect("could not request a video pad from mpegtsmux");
+                                queue
+                                    .static_pad("src")
+                                    .unwrap()
+                                    .link(&mux_video_pad)
+                                    .expect("could not link video queue src to mpegtsmux");
+
+                                src_pad
+                                    .link(&videoconvert.static_pad("sink").unwrap())
+                                    .expect("could not link video decodebin src to videoconvert");
+                            });
+
+                            let decodebin_sink = decodebin
+                                .sink_pads()
+                                .into_iter()
+                                .next()
+                                .expect("video decodebin has no sink pad");
+                            pad.link(&decodebin_sink)
+                                .expect("could not link video whep pad to video decodebin");
+                        }
                     }
                 }
                 _ => {
@@ -556,6 +769,190 @@ fn main() {
         .expect("Unable to set the pipeline to the `Null` state");
 
     std::thread::sleep(std::time::Duration::from_secs(1));
+}
+
+// Patches MPEG-TS buffers in-place to remove the HDMV registration descriptor from the PMT.
+// mpegtsmux adds this descriptor unconditionally for H.264 streams.  When present without an
+// accompanying AVCDecoderConfigurationRecord, FFmpeg >= 8 enters HDMV mode and refuses to
+// read inline SPS/PPS, causing "non-existing PPS 0 referenced" even when SPS/PPS are present
+// in the elementary stream.  Removing the HDMV identifier makes FFmpeg treat the stream as
+// plain TS H.264 and parse inline SPS/PPS normally.
+struct PmtPatcher {
+    pmt_pid: Option<u16>,
+    patch_logged: bool,
+}
+
+impl PmtPatcher {
+    fn new() -> Self {
+        Self {
+            pmt_pid: None,
+            patch_logged: false,
+        }
+    }
+
+    fn process(&mut self, data: &mut [u8]) {
+        let mut pos = 0;
+        while pos + 188 <= data.len() {
+            let pkt = &mut data[pos..pos + 188];
+            if pkt[0] != 0x47 {
+                pos += 1;
+                continue;
+            }
+            let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+            let pusi = pkt[1] & 0x40 != 0;
+            // adaptation_field_control bits [5:4] of byte 3
+            let afc = (pkt[3] >> 4) & 0x03;
+            let payload_start: Option<usize> = match afc {
+                1 => Some(4),
+                3 => {
+                    let af_len = pkt[4] as usize;
+                    let s = 5 + af_len;
+                    if s < 188 { Some(s) } else { None }
+                }
+                _ => None,
+            };
+            if let Some(ps) = payload_start {
+                if pid == 0 && pusi {
+                    self.read_pat(&pkt[ps..]);
+                } else if self.pmt_pid == Some(pid) && pusi {
+                    self.patch_pmt(&mut pkt[ps..]);
+                }
+            }
+            pos += 188;
+        }
+    }
+
+    fn read_pat(&mut self, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        let ptr = payload[0] as usize;
+        if 1 + ptr + 12 > payload.len() {
+            return;
+        }
+        let s = &payload[1 + ptr..];
+        if s[0] != 0x00 {
+            return; // table_id must be PAT (0x00)
+        }
+        let sec_len = ((s[1] as usize & 0x0F) << 8) | s[2] as usize;
+        let sec_total = 3 + sec_len;
+        if sec_total > s.len() {
+            return;
+        }
+        let entries_end = sec_total - 4; // exclude 4-byte CRC32 at end
+        let mut i = 8usize; // program entries start after 8-byte fixed header
+        while i + 4 <= entries_end {
+            let prog = ((s[i] as u16) << 8) | s[i + 1] as u16;
+            let ppid = ((s[i + 2] as u16 & 0x1F) << 8) | s[i + 3] as u16;
+            if prog != 0 {
+                if self.pmt_pid.is_none() {
+                    info!("[PMT-PATCH] PMT PID: {ppid:#05x}");
+                    self.pmt_pid = Some(ppid);
+                }
+                return;
+            }
+            i += 4;
+        }
+    }
+
+    fn patch_pmt(&mut self, payload: &mut [u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        let ptr = payload[0] as usize;
+        let so = 1 + ptr;
+        if so + 12 > payload.len() {
+            return;
+        }
+        let s = &mut payload[so..];
+        if s[0] != 0x02 {
+            return; // table_id must be PMT (0x02)
+        }
+        let sec_len = ((s[1] as usize & 0x0F) << 8) | s[2] as usize;
+        let sec_total = 3 + sec_len;
+        if sec_total > s.len() {
+            return; // PMT spans packets; skip
+        }
+        let s = &mut s[..sec_total];
+
+        // program_info_length at bytes [10..12] (upper 4 bits reserved)
+        let pil = ((s[10] as usize & 0x0F) << 8) | s[11] as usize;
+        let prog_end = 12 + pil; // end of program-level descriptor loop
+        let crc_pos = sec_total - 4;
+        if prog_end > crc_pos {
+            return;
+        }
+
+        let mut patched = false;
+
+        // Pass 1: scan the program-level descriptor loop.
+        patched |= patch_hdmv_in_range(s, 12, prog_end);
+
+        // Pass 2: scan each elementary stream's ES_info descriptor loop.
+        // Each ES entry is: stream_type(1) + elementary_PID(2) + ES_info_length(2) + descriptors.
+        let mut i = prog_end;
+        while i + 5 <= crc_pos {
+            let es_info_len = ((s[i + 3] as usize & 0x0F) << 8) | s[i + 4] as usize;
+            let es_desc_start = i + 5;
+            let es_desc_end = es_desc_start + es_info_len;
+            if es_desc_end > crc_pos {
+                break;
+            }
+            patched |= patch_hdmv_in_range(s, es_desc_start, es_desc_end);
+            i = es_desc_end;
+        }
+
+        if patched {
+            // Recompute MPEG-2 CRC32 over the section (table_id through last byte before CRC).
+            let crc = crc32_mpeg2(&s[..crc_pos]);
+            s[crc_pos] = (crc >> 24) as u8;
+            s[crc_pos + 1] = (crc >> 16) as u8;
+            s[crc_pos + 2] = (crc >> 8) as u8;
+            s[crc_pos + 3] = crc as u8;
+            if !self.patch_logged {
+                info!("[PMT-PATCH] Removed HDMV registration descriptor from PMT");
+                self.patch_logged = true;
+            }
+        }
+    }
+}
+
+// Scans a PMT descriptor loop in `s[start..end]` for a registration_descriptor (tag 0x05)
+// whose 4-byte format_identifier equals "HDMV", and zeroes that identifier.  Returns true if a
+// patch was applied.  mpegtsmux can emit this descriptor either in the program_info loop or in
+// the per-elementary-stream ES_info loop, depending on version, so the caller invokes this for
+// both.
+fn patch_hdmv_in_range(s: &mut [u8], start: usize, end: usize) -> bool {
+    let mut i = start;
+    while i + 2 <= end {
+        let tag = s[i];
+        let len = s[i + 1] as usize;
+        if i + 2 + len > end {
+            break;
+        }
+        if tag == 0x05 && len >= 4 && &s[i + 2..i + 6] == b"HDMV" {
+            s[i + 2..i + 6].copy_from_slice(&[0u8; 4]);
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
+}
+
+// MPEG-2 CRC32: poly 0x04C11DB7, init 0xFFFFFFFF, no reflection, no final XOR.
+fn crc32_mpeg2(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        for bit in (0..8u32).rev() {
+            let b = u32::from((byte >> bit) & 1);
+            let msb = crc >> 31;
+            crc <<= 1;
+            if msb ^ b != 0 {
+                crc ^= 0x04C11DB7;
+            }
+        }
+    }
+    crc
 }
 
 fn debug_pipeline(pipe: &gst::Bin, str: &str) {
