@@ -28,9 +28,13 @@ pub struct Args {
     #[clap(long)]
     pub dot_debug: bool,
 
-    /// Jitterbuffer latency in milliseconds (sets rtpbin latency and liveadder min-upstream-latency)
-    #[clap(long, env = "WHEP_SRT_JITTERBUFFER_LATENCY", default_value_t = 200)]
-    pub latency: u64,
+    /// Jitterbuffer latency in milliseconds (sets rtpbin latency and liveadder min-upstream-latency).
+    /// If unset, defaults to 200 for audio-only setups and 2000 when `--bridge-video` is enabled —
+    /// WebRTC video sources commonly exhibit 1–2 s RTP clock skew, which combined with
+    /// `drop-on-latency=true` would otherwise discard IDR packets and leave subscribers without a
+    /// decode entry point.
+    #[clap(long, env = "WHEP_SRT_JITTERBUFFER_LATENCY")]
+    pub latency: Option<u64>,
 
     /// Authorization token for WHEP endpoint
     #[clap(long, env = "WHEP_SRT_AUTH_TOKEN")]
@@ -64,8 +68,10 @@ fn main() {
     let whep_url = args.input_url;
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
-    let latency = args.latency;
     let bridge_video = args.bridge_video;
+    let latency = args
+        .latency
+        .unwrap_or(if bridge_video { 2000 } else { 200 });
     let video_bitrate = args.video_bitrate;
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
@@ -502,6 +508,15 @@ fn main() {
                                 .build()
                                 .expect("could not create h264parse");
                             h264parse.set_property_from_str("config-interval", "-1");
+                            // Force h264parse to re-parse instead of passing buffers through
+                            // unchanged: with the default disable-passthrough=false, h264parse
+                            // can slip into passthrough mode when input alignment matches the
+                            // downstream request, leaving NAL-aligned (rather than AU-aligned)
+                            // buffers heading into mpegtsmux which then mis-frames the stream.
+                            // The format change (avc → byte-stream) already forces re-parsing
+                            // in practice today, but disable-passthrough=true is cheap insurance
+                            // against a build that interprets the negotiation differently.
+                            h264parse.set_property_from_str("disable-passthrough", "true");
                             let stream_caps = ElementFactory::make("capsfilter")
                                 .build()
                                 .expect("could not create h264 stream capsfilter");
