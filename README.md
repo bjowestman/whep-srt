@@ -88,7 +88,8 @@ docker run -it whep-srt -i <WHEP_ENDPOINT_URL> -o <SRT_OUTPUT_URL>
 | `-o, --output-url` | | SRT output stream URL | `srt://0.0.0.0:1234?mode=listener` |
 | `--auth-token` | `WHEP_SRT_AUTH_TOKEN` | Authorization token for WHEP endpoint | - |
 | `--latency` | `WHEP_SRT_JITTERBUFFER_LATENCY` | Jitterbuffer latency in ms (sets rtpbin latency and liveadder min-upstream-latency). When `--bridge-video` is enabled the default rises because WebRTC video sources commonly exhibit 1–2 s RTP clock skew; with `drop-on-latency=true` a 200 ms window would discard the IDR packets the rest of the chain depends on. | `200` (audio-only), `2000` (with `--bridge-video`) |
-| `--bridge-video` | | Bridge incoming video tracks into the SRT output (H.264 passthrough, otherwise transcode to H.264) | `false` |
+| `--bridge-video` | | Bridge incoming video tracks into the SRT output (transcoded to H.264 in MPEG-TS) | `false` |
+| `--passthrough` | | Opt into bitstream passthrough when the WHEP source is already H.264 — skips decode/re-encode and forwards the source bitstream directly. Saves CPU and one generation of encoding loss but the subscriber inherits all source-side flakiness (sparse keyframes, RTP packet loss → decode corruption). Non-H.264 sources still transcode. Only effective with `--bridge-video`. | `false` |
 | `--video-bitrate` | `WHEP_SRT_VIDEO_BITRATE` | x264enc target bitrate in kbps (only used when transcoding) | `8000` |
 | `--video-preset` | `WHEP_SRT_VIDEO_PRESET` | x264enc speed-preset: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, `placebo`. Slower = better quality at same bitrate, more CPU. (only used when transcoding) | `fast` |
 | `--video-key-int` | `WHEP_SRT_VIDEO_KEY_INT` | x264enc max keyframe interval in frames. Smaller = faster initial sync for new viewers, worse compression efficiency. (only used when transcoding) | `60` |

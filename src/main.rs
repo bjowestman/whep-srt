@@ -2,7 +2,7 @@ use clap::Parser;
 use env_logger::Env;
 use log::{self, error, info};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,9 +40,20 @@ pub struct Args {
     #[clap(long, env = "WHEP_SRT_AUTH_TOKEN")]
     pub auth_token: Option<String>,
 
-    /// Bridge video tracks from WHEP to SRT output (re-encodes to H.264 in MPEG-TS)
+    /// Bridge video tracks from WHEP to SRT output (transcodes to H.264 in MPEG-TS by default;
+    /// pass `--passthrough` to skip re-encoding when the source is already H.264).
     #[clap(long)]
     pub bridge_video: bool,
+
+    /// Skip the decode/re-encode step when the WHEP source is already H.264 — passes the
+    /// source bitstream straight through to MPEG-TS. Saves a generation of encoding loss
+    /// and ~1 core of CPU, but exposes the subscriber to all source-side flakiness:
+    /// variable bitrate, sparse keyframes, RTP packet loss → visible decode corruption.
+    /// Default is to transcode regardless of source codec, which is more robust for
+    /// arbitrary WebRTC publishers. Only effective when --bridge-video is also set and
+    /// the source negotiates H.264; non-H.264 sources always transcode.
+    #[clap(long)]
+    pub passthrough: bool,
 
     /// x264enc bitrate in kbps (used when --bridge-video is set)
     #[clap(long, env = "WHEP_SRT_VIDEO_BITRATE", default_value_t = 8000)]
@@ -59,6 +70,14 @@ pub struct Args {
     /// give faster initial sync for new viewers but worse compression efficiency.
     #[clap(long, env = "WHEP_SRT_VIDEO_KEY_INT", default_value_t = 60)]
     pub video_key_int: u32,
+
+    /// How often to send an upstream PLI to the WHEP publisher (in ms) while at least one
+    /// SRT subscriber is connected. Browser WebRTC senders emit IDRs only on demand, so
+    /// without periodic PLI an SRT consumer joining mid-stream may wait tens of seconds
+    /// for a decode entry point. Only applies when --bridge-video is set and only fires
+    /// while subscriber count > 0. Set to 0 to disable.
+    #[clap(long, env = "WHEP_SRT_VIDEO_PLI_INTERVAL_MS", default_value_t = 2000)]
+    pub video_pli_interval_ms: u64,
 }
 
 fn main() {
@@ -69,12 +88,14 @@ fn main() {
     let output_url = args.output_url;
     let dot_debug = args.dot_debug;
     let bridge_video = args.bridge_video;
+    let passthrough = args.passthrough;
     let latency = args
         .latency
         .unwrap_or(if bridge_video { 2000 } else { 200 });
     let video_bitrate = args.video_bitrate;
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
+    let video_pli_interval_ms = args.video_pli_interval_ms;
 
     if dot_debug {
         let current_dir = format!(
@@ -94,11 +115,20 @@ fn main() {
 
     info!("SRT output at {output_url}");
     if bridge_video {
-        info!(
-            "video bridging enabled: H.264 passthrough when source is H.264, \
-             otherwise transcode via x264 (preset={video_preset}, bitrate={video_bitrate} kbps, \
-             key-int-max={video_key_int}, tune=zerolatency)"
-        );
+        if passthrough {
+            info!(
+                "video bridging enabled: H.264 passthrough opt-in active — H.264 sources pass through \
+                 untouched, other codecs transcode to H.264 via x264 (preset={video_preset}, \
+                 bitrate={video_bitrate} kbps, key-int-max={video_key_int}, tune=zerolatency)"
+            );
+        } else {
+            info!(
+                "video bridging enabled: transcode mode (default) — all sources decode then re-encode \
+                 to H.264 via x264 (preset={video_preset}, bitrate={video_bitrate} kbps, \
+                 key-int-max={video_key_int}, tune=zerolatency). Pass --passthrough to skip re-encoding \
+                 for H.264 sources."
+            );
+        }
     }
     info!("---");
 
@@ -229,9 +259,17 @@ fn main() {
         let srt_sink = pipeline
             .by_name("srt_sink")
             .expect("could not find srt_sink element");
+
+        // Track active SRT subscribers so the periodic PLI loop below only runs cost on the
+        // publisher while someone is actually downstream. caller-added/-removed fire on srtsink
+        // in listener mode; we also use the count for diagnostic logging.
+        let subscriber_count = Arc::new(AtomicUsize::new(0));
+
         let pipeline_for_keyframe = pipeline.clone();
+        let subscriber_count_added = Arc::clone(&subscriber_count);
         srt_sink.connect("caller-added", false, move |_values| {
-            info!("SRT subscriber connected — sending PLI burst");
+            let n = subscriber_count_added.fetch_add(1, Ordering::SeqCst) + 1;
+            info!("SRT subscriber connected (count={n}) — sending PLI burst");
             let pipeline_for_thread = pipeline_for_keyframe.clone();
             std::thread::spawn(move || {
                 for (idx, &delay_ms) in [0u64, 500, 1500].iter().enumerate() {
@@ -255,6 +293,48 @@ fn main() {
             });
             None
         });
+
+        let subscriber_count_removed = Arc::clone(&subscriber_count);
+        srt_sink.connect("caller-removed", false, move |_values| {
+            // Defensive saturating decrement: caller-removed should never fire when count==0,
+            // but underflowing an AtomicUsize would wedge the periodic PLI loop on permanently.
+            let prev = subscriber_count_removed
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .unwrap_or(0);
+            info!("SRT subscriber disconnected (count={})", prev.saturating_sub(1));
+            None
+        });
+
+        // Periodic upstream PLI. Browser WebRTC publishers emit IDRs only on demand
+        // (NACK/PLI/FIR or stream-start/reconfigure), so without this an SRT subscriber
+        // joining mid-stream waits up to the next natural IDR — observed in the wild
+        // at ~30 s gaps. The thread runs forever and gates on the live subscriber count
+        // so we don't bill the publisher when no one is listening.
+        if video_pli_interval_ms > 0 {
+            let pipeline_for_periodic = pipeline.clone();
+            let subscriber_count_timer = Arc::clone(&subscriber_count);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(video_pli_interval_ms));
+                if subscriber_count_timer.load(Ordering::SeqCst) == 0 {
+                    continue;
+                }
+                if let Some(video_queue) = pipeline_for_periodic.by_name("video_queue") {
+                    let s = gst::Structure::builder("GstForceKeyUnit")
+                        .field("all-headers", true)
+                        .build();
+                    let sent =
+                        video_queue.send_event(gst::event::CustomUpstream::new(s));
+                    log::debug!("periodic PLI sent={sent}");
+                }
+            });
+            info!(
+                "periodic upstream PLI enabled: interval={video_pli_interval_ms}ms (gated on SRT subscriber count)"
+            );
+        } else {
+            info!("periodic upstream PLI disabled (interval=0)");
+        }
     }
 
     // Guard: only the first arriving video pad is bridged; additional video tracks go to fakesink.
@@ -286,9 +366,37 @@ fn main() {
         let _ = bin;
 
         if elem_type == "GstRtpBin" {
-            info!("setting rtpbin latency to {latency} ms, drop-on-latency=true");
+            // drop-on-latency was previously set to true as a workaround for an audio-stall
+            // bug in rtpjitterbuffer after long mute + packet loss inside the first second.
+            // With --bridge-video that setting actively destroys video: WebRTC sources on
+            // this pipeline regularly exhibit 1–2 s RTP clock skew (visible in logs as
+            // "delta - skew … reset skew"), and drop-on-latency=true then discards the
+            // RTP fragments that belong to P-frames during those skew excursions —
+            // producing classic decode-corruption (smeared macroblocks, ghost trails,
+            // edge noise) or, when an IDR's fragments are hit, a stream where the
+            // subscriber never gets a decode entry point and sees audio-only output.
+            // Browsers don't drop in this scenario; they delay. We now mirror that.
+            // If the original audio-stall bug resurfaces, the proper fix is a per-session
+            // setting (drop-on-latency on the audio jitterbuffer only) rather than the
+            // global rtpbin property.
+            info!(
+                "setting rtpbin latency to {latency} ms, drop-on-latency=false, \
+                 do-retransmission=true"
+            );
             elem.set_property_from_str("latency", &latency.to_string());
-            elem.set_property_from_str("drop-on-latency", "true"); //workaround for large packet_sizing bug in rtpjitterbuffer after long mute + packet loss within first second => stalled audio
+            elem.set_property_from_str("drop-on-latency", "false");
+            // Enable RTP retransmission: when the jitterbuffer detects a missing sequence
+            // number, send NACK upstream and accept the retransmitted packet (RTX, RFC 4588).
+            // Browsers do this by default; without it, any lost RTP packet stays lost and
+            // produces the classic H.264 decoder corruption we've been chasing (smeared
+            // macroblocks, ghost trails) — the source-side SDP advertises rtcp-fb-nack=true
+            // so it's prepared to honor the requests.
+            elem.set_property_from_str("do-retransmission", "true");
+            // Note: do-lost=true was tried but mpegtsmux floods the log with "GAP event
+            // outside segment, dropping" warnings — it doesn't know how to handle the
+            // GstRTPPacketLost → GstEventGap propagation. The events are useful for raw
+            // decoders that can error-conceal, but mpegtsmux is our downstream and it
+            // just discards them. Leaving do-lost at its default (false).
         }
 
         if elem_type == "GstWebRTCBin" {
@@ -483,7 +591,7 @@ fn main() {
                             .dynamic_cast_ref::<gst::Bin>()
                             .expect("could not cast pipeline to bin");
 
-                        if encoding_name.eq_ignore_ascii_case("H264") {
+                        if passthrough && encoding_name.eq_ignore_ascii_case("H264") {
                             info!("bridging H.264 video track to SRT output (passthrough — no transcode)");
 
                             // rtph264depay → capsfilter(stream-format=avc) → h264parse →
