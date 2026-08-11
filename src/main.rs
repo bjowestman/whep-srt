@@ -1,11 +1,12 @@
 use clap::Parser;
 use env_logger::Env;
-use log::{self, error, info};
+use log::{self, error, info, warn};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
@@ -80,6 +81,43 @@ pub struct Args {
     pub video_pli_interval_ms: u64,
 }
 
+/// Length of an RTP packet's payload, skipping the CSRC list and any header extension
+/// (RFC 3550 §5.1). `None` when the buffer is too short to be a valid RTP packet.
+fn rtp_payload_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let csrc_count = (bytes[0] & 0x0f) as usize;
+    let mut offset = 12 + 4 * csrc_count;
+    if bytes[0] & 0x10 != 0 {
+        if bytes.len() < offset + 4 {
+            return None;
+        }
+        let ext_words = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        offset += 4 + 4 * ext_words;
+    }
+    Some(bytes.get(offset..)?.len())
+}
+
+/// Whether an RTP packet is evidence that its stream carries real media, as opposed to being a
+/// bandwidth-probing stream.
+///
+/// Needed because SMB hands a WHEP consumer one padding-only stream per session alongside the
+/// real video, on the same payload type and the same `a-mid`, so the caps cannot tell them apart.
+///
+/// Two signals, either sufficient. An unpadded packet (P bit clear) is ordinary media: measured
+/// over a full session the real video track set P on 0 of 4891 packets while the probing track
+/// set it on 293 of 293. A marker bit is the other tell — it terminates a video frame, and the
+/// probing track never sets one — which keeps this from misjudging a real sender that pads its
+/// media for rate control.
+///
+/// Note the padding *length* cannot be used here: the RFC 3550 pad count is a single byte, so a
+/// payload over 255 bytes is never "all padding" by that measure even when it carries no media,
+/// which is exactly the shape these packets have (measured: 97..1169 bytes).
+fn rtp_carries_media(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && (bytes[0] & 0x20 == 0 || bytes[1] & 0x80 != 0)
+}
+
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
@@ -96,6 +134,14 @@ fn main() {
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
     let video_pli_interval_ms = args.video_pli_interval_ms;
+    // DIAGNOSTIC: when set to a directory path, the transcode path writes the
+    // DECODED video frames (before any re-encode) as JPEGs there so we can see
+    // exactly what the bridge receives & decodes, independent of x264/mux/SRT.
+    let dump_frames = std::env::var("WHEP_SRT_DUMP_FRAMES").ok();
+    // DIAGNOSTIC: per-SSRC RTP and jitterbuffer statistics, logged every 5 seconds. Off by
+    // default — it emits a line per SSRC per interval, which is far too noisy for a normal run,
+    // but it is the tool for questions about which stream is which on the wire.
+    let rtp_diag = std::env::var("WHEP_SRT_RTP_DIAG").as_deref() == Ok("1");
 
     if dot_debug {
         let current_dir = format!(
@@ -337,8 +383,16 @@ fn main() {
         }
     }
 
-    // Guard: only the first arriving video pad is bridged; additional video tracks go to fakesink.
+    // Guard: exactly one video track is bridged; additional video tracks go to fakesink.
     let video_bridged = Arc::new(AtomicBool::new(false));
+
+    // Names of pads whose caps have confirmed them as video tracks, for logging and for the
+    // watchdog below. This source (SMB) exposes more than one video track — a high-rate stream
+    // and a low-rate one, both payload 97 H.264 on a-mid=video0 with different SSRCs — alongside
+    // the OPUS audio track, so it is worth recording which ones were seen and which was bridged.
+    let video_pad_names: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    // How long to wait before concluding that no video is going to reach the output.
+    const VIDEO_SELECT_FALLBACK: Duration = Duration::from_secs(5);
 
     let input_whep_bin = pipeline
         .by_name("input")
@@ -381,22 +435,93 @@ fn main() {
             // global rtpbin property.
             info!(
                 "setting rtpbin latency to {latency} ms, drop-on-latency=false, \
-                 do-retransmission=true"
+                 do-retransmission=false"
             );
             elem.set_property_from_str("latency", &latency.to_string());
             elem.set_property_from_str("drop-on-latency", "false");
-            // Enable RTP retransmission: when the jitterbuffer detects a missing sequence
-            // number, send NACK upstream and accept the retransmitted packet (RTX, RFC 4588).
-            // Browsers do this by default; without it, any lost RTP packet stays lost and
-            // produces the classic H.264 decoder corruption we've been chasing (smeared
-            // macroblocks, ghost trails) — the source-side SDP advertises rtcp-fb-nack=true
-            // so it's prepared to honor the requests.
-            elem.set_property_from_str("do-retransmission", "true");
+            // RTP retransmission (NACK/RTX, RFC 4588) is DISABLED on this path.
+            //
+            // It sounds right — browsers do it and it recovers loss — but the WHEP
+            // answer from the manager strips a=ssrc-group:FID (it's a shared code
+            // path that browsers depend on), so webrtcbin can never pair the RTX
+            // repair SSRC with the main video. The [rtx-diag] capture proved the
+            // consequence: rtx-success-count stays 0 for the whole session while
+            // rtx-count climbs into the hundreds of thousands, a third (phantom)
+            // jitterbuffer appears for the unpaired RTX SSRC, and the main stream
+            // ends with more packets declared lost than pushed. That is a NACK-storm
+            // feedback collapse, not real loss — on this same-DC path genuine loss is
+            // ~0 until the storm congests the link. Turning retransmission off breaks
+            // the cascade at the source: no NACKs → SMB sends no RTX → no phantom
+            // jitterbuffer → clean sequence tracking. Keyframe recovery still comes
+            // from the periodic/­on-subscribe PLI below. If FID is ever delivered to
+            // this consumer specifically, revisit (RTX would then actually work).
+            elem.set_property_from_str("do-retransmission", "false");
             // Note: do-lost=true was tried but mpegtsmux floods the log with "GAP event
             // outside segment, dropping" warnings — it doesn't know how to handle the
             // GstRTPPacketLost → GstEventGap propagation. The events are useful for raw
             // decoders that can error-conceal, but mpegtsmux is our downstream and it
             // just discards them. Leaving do-lost at its default (false).
+
+            // Diagnostic instrumentation (read-only), gated on WHEP_SRT_RTP_DIAG: track every
+            // jitterbuffer rtpbin creates and periodically dump its stats. The per-SSRC numbers
+            // are what tell you whether loss is real on this path (num-lost) and whether RTX
+            // recovers anything (rtx-count vs rtx-success-count).
+            //
+            // A caution when reading them, learned the hard way: against SMB the extra
+            // jitterbuffer beyond audio + video is NOT an unpaired RTX stream, as was first
+            // assumed. It is SMB's per-session bandwidth-probing stream — padding-only, on the
+            // media payload type. And num-lost on the bridged video runs to a large fraction of
+            // num-pushed while the picture decodes cleanly, so treat it as a sequence-jump
+            // bookkeeping artifact of ssrc-rewrite egress rather than as real loss.
+            let jbs: Arc<Mutex<Vec<(u32, u32, gst::Element)>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let jbs_for_signal = Arc::clone(&jbs);
+            elem.connect("new-jitterbuffer", false, move |values| {
+                let jb = values[1].get::<gst::Element>().ok()?;
+                let session = values[2].get::<u32>().unwrap_or(0);
+                let ssrc = values[3].get::<u32>().unwrap_or(0);
+                // Enforce no-retransmission per jitterbuffer as well as on the
+                // parent rtpbin: webrtcbin can re-assert do-retransmission when it
+                // sets up a session, so we pin it off on each jitterbuffer the
+                // moment it's created — before it can emit its first NACK.
+                jb.set_property_from_str("do-retransmission", "false");
+                let count = {
+                    let mut v = jbs_for_signal.lock().unwrap();
+                    v.push((session, ssrc, jb));
+                    v.len()
+                };
+                if rtp_diag {
+                    info!(
+                        "[rtx-diag] new jitterbuffer: session={session} ssrc={ssrc:#010x} \
+                         (total jitterbuffers now {count})"
+                    );
+                }
+                None
+            });
+            if rtp_diag {
+                let jbs_for_thread = Arc::clone(&jbs);
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let snapshot = {
+                        let v = jbs_for_thread.lock().unwrap();
+                        v.clone()
+                    };
+                    for (session, ssrc, jb) in &snapshot {
+                        let stats = jb.property::<gst::Structure>("stats");
+                        let g = |k: &str| stats.get::<u64>(k).unwrap_or(0);
+                        info!(
+                            "[rtx-diag] session={session} ssrc={ssrc:#010x} pushed={} \
+                             lost={} late={} dup={} rtx-req={} rtx-ok={}",
+                            g("num-pushed"),
+                            g("num-lost"),
+                            g("num-late"),
+                            g("num-duplicates"),
+                            g("rtx-count"),
+                            g("rtx-success-count")
+                        );
+                    }
+                });
+            }
         }
 
         if elem_type == "GstWebRTCBin" {
@@ -464,7 +589,84 @@ fn main() {
         }
     });
 
+    // Make the "preferred pad never delivered" case loud instead of silent: if video bridging is
+    // on and nothing has been bridged by the deadline, say so and name the candidates. This does
+    // not hot-swap to a discarded pad — relinking off a fakesink needs a deliberate pad-block
+    // dance — but it turns an unexplained black output into a one-line diagnosis.
+    if bridge_video {
+        let video_bridged_watchdog = video_bridged.clone();
+        let video_pad_names_watchdog = video_pad_names.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(VIDEO_SELECT_FALLBACK);
+            if !video_bridged_watchdog.load(Ordering::Acquire) {
+                let candidates = video_pad_names_watchdog.lock().unwrap();
+                if candidates.is_empty() {
+                    warn!(
+                        "no video track bridged after {}s: the source has not exposed any video \
+                         pad yet",
+                        VIDEO_SELECT_FALLBACK.as_secs()
+                    );
+                } else {
+                    warn!(
+                        "no video track bridged after {}s despite confirmed video pads {:?} — \
+                         SRT output has no video",
+                        VIDEO_SELECT_FALLBACK.as_secs(),
+                        candidates
+                    );
+                }
+            }
+        });
+    }
+
+    // Per-SSRC RTP tally, logged every 5s as [pt-diag]. Opt-in via WHEP_SRT_RTP_DIAG=1: it is
+    // how the padding-only probing stream was identified in the first place, so it is worth
+    // keeping, but it prints a line per SSRC per interval and has no place in a normal run.
+    //
+    // Covers every pad the WHEP source exposes, including video pads that lose selection, since
+    // the interesting question is usually about the track that was NOT bridged.
+    struct PtTally {
+        pad: String,
+        packets: u64,
+        markers: u64,
+        padding: u64,
+        first_seq: u16,
+        last_seq: u16,
+        // Payload shape names the stream: an H.264 media packet starts with a NAL header (low 5
+        // bits = NAL type, and 0x78 is a STAP-A aggregate whose first inner NAL follows a 2-byte
+        // size), whereas the probing stream's payload is zeros. Sampled from the first packet.
+        sample_hex: String,
+        min_payload: usize,
+        max_payload: usize,
+    }
+    let pt_tally: Arc<Mutex<BTreeMap<(u32, u8), PtTally>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    if rtp_diag {
+        let pt_tally_for_thread = Arc::clone(&pt_tally);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let tally = pt_tally_for_thread.lock().unwrap();
+            for ((ssrc, pt), t) in tally.iter() {
+                info!(
+                    "[pt-diag] pad='{}' ssrc={ssrc:#010x} pt={pt} packets={} markers={} \
+                     padding={} seq={}..{} payload={}..{}B first_payload=[{}]",
+                    t.pad,
+                    t.packets,
+                    t.markers,
+                    t.padding,
+                    t.first_seq,
+                    t.last_seq,
+                    t.min_payload,
+                    t.max_payload,
+                    t.sample_hex
+                );
+            }
+        });
+    }
+
     let video_preset_for_probe = video_preset.clone();
+    let dump_frames_for_probe = dump_frames.clone();
+    let video_pad_names_for_probe = video_pad_names.clone();
+    let pt_tally_for_probe = Arc::clone(&pt_tally);
     input_whep_bin.connect_pad_added(move |elem, pad| {
         info!(
             "pad added on {} named '{}': '{}'",
@@ -477,8 +679,78 @@ fn main() {
         let mixer_clone = mixer_clone.clone();
         let video_bridged = video_bridged.clone();
         let video_preset = video_preset_for_probe.clone();
+        let dump_frames = dump_frames_for_probe.clone();
+        let video_pad_names = video_pad_names_for_probe.clone();
 
-        pad.add_probe(PadProbeType::BUFFER, move |pad, _probe_info| {
+        // [pt-diag] tally probe. Registered before the selection probe below and never removed,
+        // so it keeps counting on pads that lose selection too — which is the whole point.
+        let pt_tally = Arc::clone(&pt_tally_for_probe);
+        let pt_tally_pad = pad.name().to_string();
+        pad.add_probe(PadProbeType::BUFFER, move |_pad, probe_info| {
+            if !rtp_diag {
+                return gst::PadProbeReturn::Ok;
+            }
+            if let Some(gst::PadProbeData::Buffer(ref buffer)) = probe_info.data {
+                if let Ok(map) = buffer.map_readable() {
+                    let bytes = map.as_slice();
+                    if bytes.len() >= 12 {
+                        let payload_type = bytes[1] & 0x7f;
+                        let marker = bytes[1] & 0x80 != 0;
+                        let has_padding = bytes[0] & 0x20 != 0;
+                        let seq = u16::from_be_bytes([bytes[2], bytes[3]]);
+                        let ssrc =
+                            u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+
+                        let payload_len = rtp_payload_len(bytes).unwrap_or(0);
+                        let payload = bytes.get(bytes.len() - payload_len..).unwrap_or(&[]);
+
+                        let mut tally = pt_tally.lock().unwrap();
+                        let entry =
+                            tally.entry((ssrc, payload_type)).or_insert_with(|| PtTally {
+                                pad: pt_tally_pad.clone(),
+                                packets: 0,
+                                markers: 0,
+                                padding: 0,
+                                first_seq: seq,
+                                last_seq: seq,
+                                sample_hex: payload
+                                    .iter()
+                                    .take(8)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                min_payload: payload_len,
+                                max_payload: payload_len,
+                            });
+                        entry.packets += 1;
+                        if marker {
+                            entry.markers += 1;
+                        }
+                        if has_padding {
+                            entry.padding += 1;
+                        }
+                        entry.min_payload = entry.min_payload.min(payload_len);
+                        entry.max_payload = entry.max_payload.max(payload_len);
+                        entry.last_seq = seq;
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        let probe_logged = AtomicBool::new(false);
+        pad.add_probe(PadProbeType::BUFFER, move |pad, probe_info| {
+            // Does this packet prove the stream carries real media rather than being SMB's
+            // bandwidth-probing stream? See rtp_carries_media.
+            let media_evidence = match probe_info.data {
+                Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
+                    .map_readable()
+                    .ok()
+                    .map(|map| rtp_carries_media(map.as_slice()))
+                    .unwrap_or(false),
+                _ => false,
+            };
+
             let Some(caps) = pad.current_caps() else {
                 error!("buffer probe: could not get caps from pad '{}'", pad.name());
                 return gstreamer::PadProbeReturn::Remove;
@@ -492,7 +764,17 @@ fn main() {
                 return gstreamer::PadProbeReturn::Remove;
             };
 
-            info!("getting {media_type} track");
+            // Include the pad name: with more than one video pad the bridge winner is decided
+            // by whichever pad first proves it carries media, so without the name the logs can't
+            // tell you which track was actually bridged versus discarded. Logged once per pad —
+            // the probe below re-runs for every buffer while a track is still unproven.
+            if !probe_logged.swap(true, Ordering::AcqRel) {
+                info!(
+                    "getting {media_type} track on pad '{}' (caps: {})",
+                    pad.name(),
+                    structure
+                );
+            }
             match media_type.as_str() {
                 "audio" => {
                     let pipe_bin = pipeline_clone
@@ -563,11 +845,62 @@ fn main() {
                         .expect("could not link from webrtcbin audio pad to decodebin");
                 }
                 "video" => {
-                    // Bridge the first video track to mpegtsmux; send additional tracks to fakesink.
-                    // video_bridged.swap returns the *previous* value, so the first caller gets false
-                    // and proceeds to bridge; all subsequent callers get true and use fakesink.
-                    // AcqRel is sufficient: we only need to synchronise this flag, not other memory.
-                    if !bridge_video || video_bridged.swap(true, Ordering::AcqRel) {
+                    // Record this pad as a confirmed video track. It has to happen here rather
+                    // than at pad-added because pad *names* do not identify media type: the
+                    // automatically-exposed pad is called `video_0` even when it carries the OPUS
+                    // audio track, so only the caps on the first buffer settle what a pad really
+                    // is. That is also why selection below cannot prefer a particular pad name.
+                    {
+                        let mut names = video_pad_names.lock().unwrap();
+                        names.insert(pad.name().to_string());
+                        if names.len() > 1 {
+                            info!("confirmed video pads so far: {:?}", names);
+                        }
+                    }
+
+                    // Selection among several video tracks, in priority order.
+                    //
+                    // SMB gives a WHEP consumer more than one video track on the same `a-mid` and
+                    // the same payload type: the forwarded publisher, plus one padding-only stream
+                    // per session that exists for bandwidth probing. Nothing in the caps separates
+                    // them, and pad *names* carry no identity either — which pad number the real
+                    // video lands on varies per session (measured: `video_src_1` in some runs,
+                    // `video_src_2` in others), so preferring a name is unsound.
+                    //
+                    // What does separate them is the payload. A padding-only packet has zero media
+                    // bytes once RFC 3550 padding is subtracted, and the probing stream is
+                    // padding-only for its entire life (measured: padding on 100% of packets, zero
+                    // marker bits, sequence starting at 0), whereas real video carries media bytes
+                    // and frame markers. So skip a track whose first packet is pure padding —
+                    // crucially WITHOUT consuming the single bridge slot, so the real video still
+                    // wins it whenever it shows up. Before this check, selection was
+                    // first-buffer-wins between the two and would intermittently bridge the
+                    // padding stream, which `decodebin` can never negotiate caps for: the SRT
+                    // output then came out audio-only.
+                    //
+                    // Until a track proves it carries media, drop its buffers and decide nothing.
+                    // Dropping is what makes waiting safe: the buffer never reaches the still-
+                    // unlinked pad, so there is no GST_FLOW_NOT_LINKED and no bus error, and the
+                    // single bridge slot stays free for whichever track proves itself first. A
+                    // probing track simply never gets here, so it never wins and never gets
+                    // linked; the real video claims the slot on its first packet.
+                    if bridge_video && !media_evidence {
+                        return gstreamer::PadProbeReturn::Drop;
+                    }
+
+                    let discard_reason = if !bridge_video {
+                        Some("video bridging disabled")
+                    } else if video_bridged.swap(true, Ordering::AcqRel) {
+                        Some("another video track was already bridged")
+                    } else {
+                        None
+                    };
+
+                    if let Some(reason) = discard_reason {
+                        info!(
+                            "discarding video pad '{}' to fakesink ({reason})",
+                            pad.name()
+                        );
                         let pipe_bin = pipeline_clone
                             .dynamic_cast_ref::<gst::Bin>()
                             .expect("could not cast pipeline to bin");
@@ -592,7 +925,10 @@ fn main() {
                             .expect("could not cast pipeline to bin");
 
                         if passthrough && encoding_name.eq_ignore_ascii_case("H264") {
-                            info!("bridging H.264 video track to SRT output (passthrough — no transcode)");
+                            info!(
+                                "bridging H.264 video track on pad '{}' to SRT output (passthrough — no transcode)",
+                                pad.name()
+                            );
 
                             // rtph264depay → capsfilter(stream-format=avc) → h264parse →
                             // capsfilter(byte-stream) → queue → mpegtsmux.
@@ -724,7 +1060,10 @@ fn main() {
                             pad.link(&depay.static_pad("sink").unwrap())
                                 .expect("could not link video whep pad to rtph264depay");
                         } else {
-                            info!("bridging {encoding_name} video track to SRT output (transcode to H.264)");
+                            info!(
+                                "bridging {encoding_name} video track on pad '{}' to SRT output (transcode to H.264)",
+                                pad.name()
+                            );
 
                             let decodebin = ElementFactory::make("decodebin")
                                 .build()
@@ -741,9 +1080,55 @@ fn main() {
                             let pipe_bin_clone = pipe_bin.clone();
                             let pipeline_for_mux = pipeline_clone.clone();
                             let video_preset = video_preset.clone();
+                            let dump_frames = dump_frames.clone();
 
                             decodebin.connect_pad_added(move |_elem, src_pad| {
                                 info!("video decodebin src pad added: '{}'", src_pad.name());
+
+                                // DIAGNOSTIC frame dump: write the DECODED frames (before any
+                                // re-encode) as JPEG. A smeary dumped frame => the source/decode
+                                // is bad (not the transcode); a crisp one => corruption is
+                                // downstream. Rate-limited to 2 fps. Enable via WHEP_SRT_DUMP_FRAMES=/dir.
+                                if let Some(ref dir) = dump_frames {
+                                    let q = ElementFactory::make("queue")
+                                        .build()
+                                        .expect("could not create dump queue");
+                                    let vconv = ElementFactory::make("videoconvert")
+                                        .build()
+                                        .expect("could not create dump videoconvert");
+                                    let vrate = ElementFactory::make("videorate")
+                                        .build()
+                                        .expect("could not create dump videorate");
+                                    let ratecaps = ElementFactory::make("capsfilter")
+                                        .build()
+                                        .expect("could not create dump ratecaps");
+                                    ratecaps.set_property_from_str("caps", "video/x-raw,framerate=2/1");
+                                    let jpegenc = ElementFactory::make("jpegenc")
+                                        .build()
+                                        .expect("could not create dump jpegenc");
+                                    let sink = ElementFactory::make("multifilesink")
+                                        .build()
+                                        .expect("could not create dump multifilesink");
+                                    sink.set_property_from_str(
+                                        "location",
+                                        &format!("{dir}/frame-%05d.jpg"),
+                                    );
+                                    let elements = [&q, &vconv, &vrate, &ratecaps, &jpegenc, &sink];
+                                    pipe_bin_clone
+                                        .add_many(elements)
+                                        .expect("could not add dump elements");
+                                    for e in elements {
+                                        e.sync_state_with_parent()
+                                            .expect("could not sync dump element");
+                                    }
+                                    gst::Element::link_many(elements)
+                                        .expect("could not link dump chain");
+                                    src_pad
+                                        .link(&q.static_pad("sink").unwrap())
+                                        .expect("could not link decoded src to dump queue");
+                                    info!("[frame-dump] writing decoded frames to {dir}/frame-*.jpg (2 fps)");
+                                    return;
+                                }
 
                                 // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
                                 // tune=zerolatency: no B-frames / no lookahead — required for live.

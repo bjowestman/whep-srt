@@ -228,6 +228,26 @@ GST_DEBUG_FILE=debug.log GST_DEBUG=*:DEBUG ./whep-srt -i <WHEP_URL>
 GST_DEBUG_DUMP_DOT_DIR=./ ./whep-srt -i <WHEP_URL>
 ```
 
+### Media Diagnostics
+
+Two opt-in environment variables, both off by default because they are noisy:
+
+| Variable | Effect |
+|----------|--------|
+| `WHEP_SRT_RTP_DIAG=1` | Logs per-SSRC RTP statistics every 5s: `[pt-diag]` (payload type, packet/marker/padding counts, sequence range, payload sizes and a sample of the first payload bytes) and `[rtx-diag]` (jitterbuffer `pushed`/`lost`/`late`/`dup`/`rtx-req`/`rtx-ok`). Use this to work out which stream on the wire is which. |
+| `WHEP_SRT_DUMP_FRAMES=<dir>` | Writes the *decoded* video frames as JPEGs at 2 fps, before any re-encode, so source/decode quality can be judged independently of x264, the muxer and SRT. Only applies when transcoding. |
+
+Two things to know when reading the output against an SMB (NeoCom intercom) source:
+
+- **A WHEP consumer receives more video streams than there are publishers.** SMB emits one
+  padding-only stream per session for bandwidth probing, on the same payload type and `a-mid` as
+  the real video. It is identifiable by the padding bit on essentially every packet, no marker
+  bits, and a payload of zeros. Track selection skips it (see `rtp_carries_media`), so it should
+  never reach the output.
+- **`lost` on the bridged video is not real loss.** It climbs to a large fraction of `pushed` in
+  exact 512-packet steps while the picture decodes cleanly — a sequence-jump bookkeeping artifact
+  of SMB's `ssrc-rewrite` egress. Audio and the probing stream stay at `lost=0` throughout.
+
 ### Pipeline Visualization
 
 The application automatically generates GraphViz DOT files of the pipeline on state changes and errors when the `--dot-debug` flag is used. The files are timestamped with the format `<epoch>-<state>.dot` (e.g., `1729000000-Playing.dot`, `1729000000-error.dot`). Convert them to SVG for visualization:
