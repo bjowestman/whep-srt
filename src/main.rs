@@ -1,8 +1,9 @@
 use clap::Parser;
 use env_logger::Env;
 use log::{self, error, info};
+use std::collections::BTreeSet;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +79,58 @@ fn rtp_carries_media(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && (bytes[0] & 0x20 == 0 || bytes[1] & 0x80 != 0)
 }
 
+/// Build an RTCP REMB packet (draft-alvestrand-rmcat-remb) advertising `bitrate_bps` as the
+/// receiver's available bandwidth for `media_ssrcs`.
+///
+/// Why this is needed at all: an SFU decides how much to send an endpoint from the REMB that
+/// endpoint reports. Symphony Media Bridge assigns `remb.getBitrate()` straight to its outbound
+/// estimate, with no validation or ramp. Browsers (libwebrtc) send REMB and get full rate; GStreamer
+/// has no REMB support, so this bridge reports nothing and the SFU leaves it pinned at its
+/// configured initial estimate.
+///
+/// Measured on a 720p25 source: the SFU logged `remb 0kbps` for this endpoint and forwarded roughly
+/// half the stream — ~13 fps with slices missing, decoding as smearing on movement, on an idle
+/// network. It is worse across a real network path, where the SFU's rate control ratchets *down* on
+/// loss and, with no REMB, has no mechanism to climb back — it settles on its configured floor and
+/// stays there for the life of the session.
+///
+/// This is an assertion, not a measurement, so it is opt-in: it is only honest on a link whose
+/// capacity is actually known, such as a wired LAN between bridge and SFU. Enabled with
+/// `WHEP_SRT_REMB_KBPS`.
+fn build_remb(sender_ssrc: u32, media_ssrcs: &[u32], bitrate_bps: u64) -> Vec<u8> {
+    // REMB encodes the bitrate as an 18-bit mantissa scaled by a 6-bit exponent, so shift the
+    // mantissa down until it fits. Rounding down keeps the claim conservative.
+    let mut mantissa = bitrate_bps;
+    let mut exponent: u32 = 0;
+    while mantissa > 0x3_FFFF {
+        mantissa >>= 1;
+        exponent += 1;
+    }
+    let mantissa = mantissa as u32;
+
+    let n = media_ssrcs.len().min(255);
+    let mut packet = Vec::with_capacity(20 + 4 * n);
+
+    // V=2, P=0, FMT=15 (application-layer feedback); PT=206 (PSFB).
+    packet.push(0x8F);
+    packet.push(0xCE);
+    // Length in 32-bit words minus one: header + sender + media + "REMB" + br + one word per SSRC.
+    let words = 5 + n as u16;
+    packet.extend_from_slice(&(words - 1).to_be_bytes());
+    packet.extend_from_slice(&sender_ssrc.to_be_bytes());
+    // Media source SSRC is unused for REMB and must be zero.
+    packet.extend_from_slice(&0u32.to_be_bytes());
+    packet.extend_from_slice(b"REMB");
+    packet.push(n as u8);
+    packet.push(((exponent as u8) << 2) | ((mantissa >> 16) & 0x03) as u8);
+    packet.push(((mantissa >> 8) & 0xFF) as u8);
+    packet.push((mantissa & 0xFF) as u8);
+    for ssrc in media_ssrcs.iter().take(n) {
+        packet.extend_from_slice(&ssrc.to_be_bytes());
+    }
+    packet
+}
+
 fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
@@ -90,6 +143,12 @@ fn main() {
     let video_bitrate = args.video_bitrate;
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
+    // Advertise this many kbps to the SFU as available downlink bandwidth, via RTCP REMB. Off
+    // unless set. See build_remb for why it exists and why it is not a default.
+    let remb_kbps: Option<u64> = std::env::var("WHEP_SRT_REMB_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|kbps| *kbps > 0);
 
     if dot_debug {
         let current_dir = format!(
@@ -209,6 +268,12 @@ fn main() {
 
     let pipeline_clone = pipeline.clone();
 
+    // SSRCs we are actually receiving, for REMB to report on. Populated by the video selection
+    // probe, which already inspects the RTP header.
+    let observed_ssrcs: Arc<Mutex<BTreeSet<u32>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    let observed_ssrcs_for_remb = Arc::clone(&observed_ssrcs);
+    let observed_ssrcs_for_probe = Arc::clone(&observed_ssrcs);
+
     pipeline.connect_deep_element_added(move |pipe, bin, elem| {
         let elem_type = elem.type_().to_string();
         let _ = pipe;
@@ -218,6 +283,86 @@ fn main() {
             info!("setting rtpbin latency to {latency} ms, drop-on-latency=true");
             elem.set_property_from_str("latency", &latency.to_string());
             elem.set_property_from_str("drop-on-latency", "true"); //workaround for large packet_sizing bug in rtpjitterbuffer after long mute + packet loss within first second => stalled audio
+
+            // Append REMB to this session's outgoing RTCP. Piggybacking on the receiver reports
+            // rtpbin already sends means no extra timer and no separate socket, and it repeats at
+            // the RTCP interval — which matters because an estimate the SFU never hears again may
+            // decay. Injected here, before webrtcbin's SRTP encryption, so it is protected like
+            // any other RTCP.
+            //
+            // Appending is safe without parsing: an RTCP compound packet is just concatenated
+            // packets, so a well-formed REMB placed after the existing ones is still valid.
+            if let Some(kbps) = remb_kbps {
+                let observed_ssrcs = Arc::clone(&observed_ssrcs_for_remb);
+                elem.connect_pad_added(move |_bin, pad| {
+                    if !pad.name().starts_with("send_rtcp_src") {
+                        return;
+                    }
+                    info!(
+                        "[remb] advertising {kbps} kbps to the SFU on pad '{}'",
+                        pad.name()
+                    );
+                    let observed_ssrcs = Arc::clone(&observed_ssrcs);
+                    let logged = AtomicBool::new(false);
+                    pad.add_probe(PadProbeType::BUFFER, move |_pad, probe_info| {
+                        let Some(gst::PadProbeData::Buffer(ref buffer)) = probe_info.data else {
+                            return gst::PadProbeReturn::Ok;
+                        };
+                        // Sent with an empty SSRC list until media arrives. Waiting for a known
+                        // SSRC would deadlock: the SFU forwards nothing until it hears an
+                        // estimate, so no SSRC would ever be observed to name in the report.
+                        // SMB reads the bitrate irrespective of the list.
+                        let ssrcs: Vec<u32> =
+                            observed_ssrcs.lock().unwrap().iter().copied().collect();
+                        let Ok(map) = buffer.map_readable() else {
+                            return gst::PadProbeReturn::Ok;
+                        };
+                        let existing = map.as_slice();
+                        // The sender SSRC of the report already in this packet is this session's
+                        // own, which is what the REMB should be attributed to.
+                        if existing.len() < 8 {
+                            return gst::PadProbeReturn::Ok;
+                        }
+                        let sender_ssrc = u32::from_be_bytes([
+                            existing[4],
+                            existing[5],
+                            existing[6],
+                            existing[7],
+                        ]);
+                        let remb = build_remb(sender_ssrc, &ssrcs, kbps * 1000);
+                        // Logged once on the first RTCP we get to piggyback on. Absence of this
+                        // line means rtpbin is emitting no RTCP at all, which is a different
+                        // problem from the SFU ignoring the estimate.
+                        if !logged.swap(true, Ordering::AcqRel) {
+                            info!(
+                                "[remb] first REMB appended to {}-byte RTCP: \
+                                 sender_ssrc={sender_ssrc:#010x} at {kbps} kbps, \
+                                 reporting {} ssrc(s) {:?}",
+                                existing.len(),
+                                ssrcs.len(),
+                                ssrcs
+                                    .iter()
+                                    .map(|s| format!("{s:#010x}"))
+                                    .collect::<Vec<_>>()
+                            );
+                        }
+                        let mut combined = Vec::with_capacity(existing.len() + remb.len());
+                        combined.extend_from_slice(existing);
+                        combined.extend_from_slice(&remb);
+                        drop(map);
+
+                        let mut out = gst::Buffer::from_mut_slice(combined);
+                        // Carry timestamps over: rtpbin's downstream scheduling relies on them.
+                        {
+                            let out_ref = out.make_mut();
+                            out_ref.set_pts(buffer.pts());
+                            out_ref.set_dts(buffer.dts());
+                        }
+                        probe_info.data = Some(gst::PadProbeData::Buffer(out));
+                        gst::PadProbeReturn::Ok
+                    });
+                });
+            }
         }
 
         if elem_type == "GstWebRTCBin" {
@@ -300,13 +445,24 @@ fn main() {
         let video_preset = video_preset_for_probe.clone();
 
         let probe_logged = AtomicBool::new(false);
+        let observed_ssrcs = Arc::clone(&observed_ssrcs_for_probe);
         pad.add_probe(PadProbeType::BUFFER, move |pad, probe_info| {
             // Does this packet prove the stream carries media? See rtp_carries_media.
             let media_evidence = match probe_info.data {
                 Some(gst::PadProbeData::Buffer(ref buffer)) => buffer
                     .map_readable()
                     .ok()
-                    .map(|map| rtp_carries_media(map.as_slice()))
+                    .map(|map| {
+                        let bytes = map.as_slice();
+                        // Recorded here because this probe already has the header mapped. Only used
+                        // to populate the REMB report; SMB reads the bitrate regardless of the list.
+                        if bytes.len() >= 12 {
+                            observed_ssrcs.lock().unwrap().insert(u32::from_be_bytes([
+                                bytes[8], bytes[9], bytes[10], bytes[11],
+                            ]));
+                        }
+                        rtp_carries_media(bytes)
+                    })
                     .unwrap_or(false),
                 _ => false,
             };
@@ -693,5 +849,75 @@ mod tests {
     fn truncated_buffers_are_not_media() {
         assert!(!rtp_carries_media(&[0x80, 0x61, 0x00]));
         assert!(!rtp_carries_media(&[]));
+    }
+
+    /// Decode a REMB packet the way a receiver (SMB) would, so the tests assert on the wire format
+    /// rather than on our own construction of it.
+    fn parse_remb(p: &[u8]) -> (u32, u64, Vec<u32>) {
+        assert_eq!(p[0], 0x8F, "V=2, FMT=15");
+        assert_eq!(p[1], 0xCE, "PT=206 PSFB");
+        let words = u16::from_be_bytes([p[2], p[3]]) as usize + 1;
+        assert_eq!(words * 4, p.len(), "length field must match actual size");
+        let sender = u32::from_be_bytes([p[4], p[5], p[6], p[7]]);
+        assert_eq!(&p[8..12], &[0, 0, 0, 0], "media ssrc unused");
+        assert_eq!(&p[12..16], b"REMB");
+        let n = p[16] as usize;
+        let exponent = (p[17] >> 2) as u32;
+        let mantissa = (((p[17] & 0x03) as u32) << 16) | ((p[18] as u32) << 8) | p[19] as u32;
+        let ssrcs = (0..n)
+            .map(|i| {
+                let o = 20 + i * 4;
+                u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]])
+            })
+            .collect();
+        (sender, (mantissa as u64) << exponent, ssrcs)
+    }
+
+    #[test]
+    fn remb_round_trips_a_typical_bitrate() {
+        let packet = build_remb(0xDEADBEEF, &[0x11223344], 10_000_000);
+        let (sender, bitrate, ssrcs) = parse_remb(&packet);
+        assert_eq!(sender, 0xDEADBEEF);
+        assert_eq!(ssrcs, vec![0x11223344]);
+        // Exponent scaling loses precision; 0.5% is far tighter than SMB cares about.
+        let error = (bitrate as f64 - 10_000_000.0).abs() / 10_000_000.0;
+        assert!(error < 0.005, "bitrate {bitrate} too far from 10 Mbps");
+    }
+
+    #[test]
+    fn remb_reports_every_observed_ssrc() {
+        let packet = build_remb(1, &[0xAAAA_AAAA, 0xBBBB_BBBB, 0xCCCC_CCCC], 4_000_000);
+        let (_, _, ssrcs) = parse_remb(&packet);
+        assert_eq!(ssrcs, vec![0xAAAA_AAAA, 0xBBBB_BBBB, 0xCCCC_CCCC]);
+        assert_eq!(packet.len(), 20 + 3 * 4);
+    }
+
+    #[test]
+    fn remb_is_valid_with_no_ssrcs_observed_yet() {
+        // The bootstrap case: nothing has arrived, but the report must still be well formed —
+        // waiting for an SSRC would deadlock, since the SFU sends nothing until it hears an estimate.
+        let packet = build_remb(42, &[], 6_000_000);
+        let (sender, _, ssrcs) = parse_remb(&packet);
+        assert_eq!(sender, 42);
+        assert!(ssrcs.is_empty());
+        assert_eq!(packet.len(), 20);
+    }
+
+    #[test]
+    fn remb_handles_bitrates_that_need_no_exponent() {
+        // Under 2^18 bps the mantissa holds the value outright, exponent 0.
+        let packet = build_remb(7, &[9], 200_000);
+        assert_eq!(packet[17] >> 2, 0, "exponent should be zero");
+        let (_, bitrate, _) = parse_remb(&packet);
+        assert_eq!(bitrate, 200_000, "small bitrates must be exact");
+    }
+
+    #[test]
+    fn remb_survives_an_absurdly_large_bitrate() {
+        // Must not panic or overflow the 18-bit mantissa; 1 Gbps is well past anything real.
+        let packet = build_remb(1, &[2], 1_000_000_000);
+        let (_, bitrate, _) = parse_remb(&packet);
+        let error = (bitrate as f64 - 1e9).abs() / 1e9;
+        assert!(error < 0.005, "bitrate {bitrate} too far from 1 Gbps");
     }
 }
