@@ -1,6 +1,6 @@
 use clap::Parser;
 use env_logger::Env;
-use log::{self, error, info};
+use log::{self, error, info, warn};
 use std::collections::BTreeSet;
 use std::sync::{
     Arc, Mutex,
@@ -56,6 +56,74 @@ pub struct Args {
     /// give faster initial sync for new viewers but worse compression efficiency.
     #[clap(long, env = "WHEP_SRT_VIDEO_KEY_INT", default_value_t = 60)]
     pub video_key_int: u32,
+
+    /// Output video size as WIDTHxHEIGHT (used when --bridge-video is set).  The encoder runs from
+    /// startup so that video is present in the very first PAT/PMT, which means the output size must
+    /// be known before the WHEP source's caps are — hence a setting rather than a passthrough of
+    /// whatever arrives.  Incoming video is scaled into this size with borders added rather than
+    /// stretched, so the aspect ratio is preserved.
+    #[clap(long, env = "WHEP_SRT_VIDEO_SIZE", default_value_t = String::from("1280x720"))]
+    pub video_size: String,
+
+    /// Output video framerate in frames per second (used when --bridge-video is set).  Fixed for
+    /// the same reason as --video-size.
+    #[clap(long, env = "WHEP_SRT_VIDEO_FPS", default_value_t = 25)]
+    pub video_fps: u32,
+}
+
+/// Build the always-present video branch: a black fill into a compositor, then the H.264 encoder
+/// and the mpegtsmux video pad.
+///
+/// Present from startup so the streamheader PAT/PMT declares video in the very first packets. The
+/// real video pad arrives from WHEP seconds later; anything that reads the program map before then
+/// — an SRT ingest the bridge dials on start, a relay that latches streamheaders and never
+/// re-reads them, a hardware decoder — would otherwise see an audio-only program and never pick
+/// video up, even though the PID starts carrying H.264 moments later. Seen in production as a
+/// video PID sitting outside the program, typed "unknown codec".
+fn build_video_branch(
+    width: u32,
+    height: u32,
+    fps: u32,
+    preset: &str,
+    bitrate: u32,
+    key_int: u32,
+) -> String {
+    format!(
+        "videotestsrc name=videofill pattern=black is-live=true \
+         ! video/x-raw,width={width},height={height},framerate={fps}/1 ! comp. \
+         compositor name=comp background=black \
+         ! video/x-raw,width={width},height={height},framerate={fps}/1 \
+         ! videoconvert \
+         ! x264enc tune=zerolatency speed-preset={preset} bitrate={bitrate} key-int-max={key_int} \
+         ! h264parse config-interval=-1 \
+         ! video/x-h264,stream-format=byte-stream,alignment=au ! queue ! mux. "
+    )
+}
+
+/// Parse a `WIDTHxHEIGHT` size, falling back to 1280x720 on anything unparseable.
+///
+/// A bad value must not be fatal: these bridges run unattended in production, and refusing to
+/// start would take audio down too — audio-only is a far better failure than no output at all.
+fn parse_video_size(spec: &str) -> (u32, u32) {
+    const FALLBACK: (u32, u32) = (1280, 720);
+    let Some((w, h)) = spec.trim().split_once(['x', 'X']) else {
+        warn!(
+            "could not parse --video-size '{spec}', using {}x{}",
+            FALLBACK.0, FALLBACK.1
+        );
+        return FALLBACK;
+    };
+    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+        // Odd dimensions break I420 chroma subsampling, so require even and non-zero.
+        (Ok(w), Ok(h)) if w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0 => (w, h),
+        _ => {
+            warn!(
+                "invalid --video-size '{spec}', using {}x{}",
+                FALLBACK.0, FALLBACK.1
+            );
+            FALLBACK
+        }
+    }
 }
 
 /// Whether an RTP packet is evidence that its stream carries real media, rather than being a
@@ -143,6 +211,8 @@ fn main() {
     let video_bitrate = args.video_bitrate;
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
+    let (video_width, video_height) = parse_video_size(&args.video_size);
+    let video_fps = args.video_fps.max(1);
     // Advertise this many kbps to the SFU as available downlink bandwidth, via RTCP REMB. Off
     // unless set. See build_remb for why it exists and why it is not a default.
     let remb_kbps: Option<u64> = std::env::var("WHEP_SRT_REMB_KBPS")
@@ -169,7 +239,8 @@ fn main() {
     info!("SRT output at {output_url}");
     if bridge_video {
         info!(
-            "video bridging enabled: x264 preset={video_preset}, bitrate={video_bitrate} kbps, \
+            "video bridging enabled: {video_width}x{video_height}@{video_fps}, x264 \
+             preset={video_preset}, bitrate={video_bitrate} kbps, \
              key-int-max={video_key_int}, tune=zerolatency"
         );
     }
@@ -203,16 +274,30 @@ fn main() {
 
     let mixer = "liveadder name=mixer"; //this could be audiomixer also, but liveadder will do fine here
 
-    // Note on the initial PMT: with --bridge-video, the real-video chain attaches to
-    // mpegtsmux dynamically when WHEP delivers a video pad (some seconds after startup).
-    // Until then the streamheader PAT/PMT advertises audio only.  SRT relays that latch
-    // onto the initial streamheaders therefore expose audio only to subscribers.  We
-    // previously tried a videotestsrc-fed input-selector to inject video into the initial
-    // PMT, but mpegtsmux's aggregator stalls on the running-time discontinuity that comes
-    // with the active-pad switch — better to keep the pipeline simple and document the
-    // limitation than to ship a stream that hangs.
+    // Real video is mixed onto a second compositor pad when it arrives (see the video branch of
+    // the pad-added handler below).  An earlier attempt used input-selector to switch between
+    // black and real video, which stalled mpegtsmux's aggregator on the running-time
+    // discontinuity at the pad switch.  compositor keeps a continuous running time across a pad
+    // added while PLAYING, so it does not.
+    //
+    // The cost is that x264 encodes continuously — roughly a core per bridge even with no
+    // publisher — and that the output size must be fixed before the source's caps are known.
+    let video_branch = if bridge_video {
+        build_video_branch(
+            video_width,
+            video_height,
+            video_fps,
+            &video_preset,
+            video_bitrate,
+            video_key_int,
+        )
+    } else {
+        String::new()
+    };
+
     let pipeline_str = format!(
         "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
+        {video_branch}\
         mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
     );
 
@@ -430,7 +515,6 @@ fn main() {
         }
     });
 
-    let video_preset_for_probe = video_preset.clone();
     input_whep_bin.connect_pad_added(move |elem, pad| {
         info!(
             "pad added on {} named '{}': '{}'",
@@ -442,7 +526,6 @@ fn main() {
         let pipeline_clone = pipeline_clone.clone();
         let mixer_clone = mixer_clone.clone();
         let video_bridged = video_bridged.clone();
-        let video_preset = video_preset_for_probe.clone();
 
         let probe_logged = AtomicBool::new(false);
         let observed_ssrcs = Arc::clone(&observed_ssrcs_for_probe);
@@ -620,75 +703,64 @@ fn main() {
                         // Clone references for the decodebin pad-added closure.
                         // pipe_bin borrow must end before pipeline_clone.clone() — NLL handles this.
                         let pipe_bin_clone = pipe_bin.clone();
-                        let pipeline_for_mux = pipeline_clone.clone();
-                        let video_preset = video_preset.clone();
+                        let pipeline_for_comp = pipeline_clone.clone();
 
                         decodebin.connect_pad_added(move |_elem, src_pad| {
                             info!("video decodebin src pad added: '{}'", src_pad.name());
 
-                            // Decode → convert → encode H.264 → byte-stream caps → queue → mux.
-                            // tune=zerolatency: no B-frames / no lookahead — required for live.
-                            // bframes=0 and CABAC are already correct via tune=zerolatency.
-                            // speed-preset / bitrate / key-int-max are tunable via CLI flags;
-                            // see Args for env var names and defaults.
+                            // Decode → convert → scale into the compositor's fixed output size.
+                            // The encoder, h264parse and the mpegtsmux video pad already exist in
+                            // the static video branch — that is what keeps video in the PAT/PMT
+                            // from the first packet — so all this leg does is mix a source in.
+                            //
+                            // add-borders keeps the source's aspect ratio, letterboxing into the
+                            // configured size instead of stretching to fill it.
                             let videoconvert = ElementFactory::make("videoconvert")
                                 .build()
                                 .expect("could not create videoconvert");
-                            let x264enc = ElementFactory::make("x264enc")
+                            let videoscale = ElementFactory::make("videoscale")
                                 .build()
-                                .expect("could not create x264enc — ensure gstreamer1.0-plugins-ugly is installed");
-                            x264enc.set_property_from_str("tune", "zerolatency");
-                            x264enc.set_property_from_str("speed-preset", &video_preset);
-                            x264enc.set_property_from_str("bitrate", &video_bitrate.to_string());
-                            x264enc.set_property_from_str("key-int-max", &video_key_int.to_string());
-                            let h264parse = ElementFactory::make("h264parse")
+                                .expect("could not create videoscale");
+                            videoscale.set_property("add-borders", true);
+                            let scale_caps = ElementFactory::make("capsfilter")
                                 .build()
-                                .expect("could not create h264parse");
-                            h264parse.set_property_from_str("config-interval", "-1");
-                            let stream_caps = ElementFactory::make("capsfilter")
-                                .build()
-                                .expect("could not create h264 stream capsfilter");
-                            stream_caps.set_property_from_str(
+                                .expect("could not create video scale capsfilter");
+                            scale_caps.set_property_from_str(
                                 "caps",
-                                "video/x-h264,stream-format=byte-stream,alignment=au",
+                                &format!("video/x-raw,width={video_width},height={video_height}"),
                             );
                             let queue = ElementFactory::make("queue")
                                 .build()
                                 .expect("could not create video queue");
 
-                            let elements = [&videoconvert, &x264enc, &h264parse, &stream_caps, &queue];
+                            let elements = [&videoconvert, &videoscale, &scale_caps, &queue];
                             pipe_bin_clone
                                 .add_many(elements)
-                                .expect("could not add video encode elements to pipeline");
+                                .expect("could not add video scale elements to pipeline");
                             for elem in elements {
                                 elem.sync_state_with_parent()
-                                    .expect("could not sync video encode element state");
+                                    .expect("could not sync video scale element state");
                             }
                             gst::Element::link_many(elements)
-                                .expect("could not link video encode chain");
+                                .expect("could not link video scale chain");
 
-                            let mux = pipeline_for_mux
-                                .by_name("mux")
-                                .expect("could not find mpegtsmux");
-                            let h264_caps = gst::Caps::builder("video/x-h264").build();
-                            let mux_video_pad = mux
-                                .pad_template_list()
-                                .into_iter()
-                                .find(|t| {
-                                    t.direction() == gst::PadDirection::Sink
-                                        && t.presence() == gst::PadPresence::Request
-                                        && t.caps().can_intersect(&h264_caps)
-                                })
-                                .inspect(|t| {
-                                    info!("requesting mpegtsmux video pad via template '{}'", t.name_template());
-                                })
-                                .and_then(|t| mux.request_pad(&t, None, None))
-                                .expect("could not request a video pad from mpegtsmux");
+                            let comp = pipeline_for_comp
+                                .by_name("comp")
+                                .expect("could not find compositor");
+                            let comp_pad = comp
+                                .request_pad_simple("sink_%u")
+                                .expect("could not request a compositor pad for the real video");
+                            // Above the black fill, which holds sink_0 at the default zorder 0.
+                            comp_pad.set_property("zorder", 1u32);
+                            info!(
+                                "mixing real video onto compositor pad '{}' ({video_width}x{video_height})",
+                                comp_pad.name()
+                            );
                             queue
                                 .static_pad("src")
                                 .unwrap()
-                                .link(&mux_video_pad)
-                                .expect("could not link video queue src to mpegtsmux");
+                                .link(&comp_pad)
+                                .expect("could not link video queue src to compositor");
 
                             src_pad
                                 .link(&videoconvert.static_pad("sink").unwrap())
@@ -797,6 +869,46 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_a_valid_size() {
+        assert_eq!(parse_video_size("1920x1080"), (1920, 1080));
+        assert_eq!(parse_video_size("640X480"), (640, 480));
+        assert_eq!(parse_video_size(" 1280 x 720 "), (1280, 720));
+    }
+
+    #[test]
+    fn falls_back_rather_than_failing_on_a_bad_size() {
+        // Unattended bridges: a bad setting must not take audio down with it.
+        for bad in [
+            "", "720p", "1280", "1280x", "x720", "0x720", "-2x720", "abcxdef",
+        ] {
+            assert_eq!(parse_video_size(bad), (1280, 720), "input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_odd_dimensions() {
+        // Odd dimensions break I420 chroma subsampling.
+        assert_eq!(parse_video_size("1281x720"), (1280, 720));
+        assert_eq!(parse_video_size("1280x721"), (1280, 720));
+    }
+
+    #[test]
+    fn video_branch_declares_video_before_the_real_source_arrives() {
+        let branch = build_video_branch(1280, 720, 25, "fast", 8000, 60);
+        // A black fill feeding the compositor is what holds the video PID in the first PMT.
+        assert!(branch.contains("videotestsrc name=videofill pattern=black is-live=true"));
+        assert!(branch.contains("compositor name=comp"));
+        // The encoder and the mux pad live here, not in the pad-added handler, so they exist
+        // before WHEP delivers video.
+        assert!(branch.contains("x264enc"));
+        assert!(branch.trim_end().ends_with("mux."));
+        assert!(branch.contains("width=1280,height=720,framerate=25/1"));
+        assert!(branch.contains("speed-preset=fast"));
+        assert!(branch.contains("bitrate=8000"));
+        assert!(branch.contains("key-int-max=60"));
+    }
 
     /// Build a minimal RTP packet: 12-byte header plus payload, with optional padding and marker
     /// bits, so the tests exercise the same bytes an SFU would put on the wire.
