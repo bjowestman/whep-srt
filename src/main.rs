@@ -6,7 +6,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
@@ -70,6 +70,10 @@ pub struct Args {
     #[clap(long, env = "WHEP_SRT_VIDEO_FPS", default_value_t = 25)]
     pub video_fps: u32,
 }
+
+/// How long to wait after committing a video track before warning that nothing has decoded.
+/// Comfortably longer than a browser publisher's GOP, so a normal start stays quiet.
+const VIDEO_DECODE_WARN_AFTER: Duration = Duration::from_secs(10);
 
 /// Build the always-present video branch: a black fill into a compositor, then the H.264 encoder
 /// and the mpegtsmux video pad.
@@ -705,8 +709,14 @@ fn main() {
                         let pipe_bin_clone = pipe_bin.clone();
                         let pipeline_for_comp = pipeline_clone.clone();
 
+                        // Set once decodebin has actually produced decoded video, which is the
+                        // condition the keyframe retry below waits on.
+                        let video_decoded = Arc::new(AtomicBool::new(false));
+                        let video_decoded_for_pad = Arc::clone(&video_decoded);
+
                         decodebin.connect_pad_added(move |_elem, src_pad| {
                             info!("video decodebin src pad added: '{}'", src_pad.name());
+                            video_decoded_for_pad.store(true, Ordering::Release);
 
                             // Decode → convert → scale into the compositor's fixed output size.
                             // The encoder, h264parse and the mpegtsmux video pad already exist in
@@ -774,6 +784,35 @@ fn main() {
                             .expect("video decodebin has no sink pad");
                         pad.link(&decodebin_sink)
                             .expect("could not link video whep pad to video decodebin");
+
+                        // A bridge joins mid-stream, so the first packets reference an SPS/IDR it
+                        // never saw, and decodebin cannot negotiate a src pad until a keyframe
+                        // arrives.  SMB does not request one for a newly created outbound context —
+                        // it only does so when the forwarded SSRC *changes* — so it forwards
+                        // mid-GOP P-frames and the bridge sits on the black fill until the
+                        // publisher's next natural IDR, measured at 120s with a Chrome publisher.
+                        //
+                        // Asking from this side does not work: both an upstream force-key-unit
+                        // event and rtph264depay's request-keyframe produce RTCP whose media SSRC
+                        // is 0, and SMB drops those ("cannot find outbound context for PLI request
+                        // ... to ssrc 0"). Both were tried and removed. The fix belongs in the SFU,
+                        // or in whoever creates the subscription; all this can usefully do is say
+                        // out loud that it is waiting, which is otherwise invisible.
+                        //
+                        // A plain thread rather than a glib timeout: this process drives its bus
+                        // with a blocking iterator and never runs a GLib main loop, so timeouts on
+                        // the default main context would never fire.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(VIDEO_DECODE_WARN_AFTER);
+                            if !video_decoded.load(Ordering::Acquire) {
+                                warn!(
+                                    "video track committed but nothing decoded after {}s — no \
+                                     keyframe from the publisher yet; output stays on the black \
+                                     fill until one arrives",
+                                    VIDEO_DECODE_WARN_AFTER.as_secs()
+                                );
+                            }
+                        });
                     }
                 }
                 _ => {
