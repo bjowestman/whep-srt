@@ -79,8 +79,8 @@ pub struct Args {
 /// (~100s), showing up as the same bridge twice. This used to be a flat 1s sleep, which lost the
 /// race often enough to be noticed.
 ///
-/// The gateway sends SIGINT and escalates to SIGKILL after 2s (whep-srt-gateway
-/// receiver.ts killProcess), so this has to stay comfortably under that.
+/// A supervising process will typically escalate SIGINT to SIGKILL after a couple of seconds —
+/// whep-srt-gateway does so at 2s — so this has to stay comfortably under that.
 const SHUTDOWN_GRACE_MS: u64 = 1500;
 
 /// How long to wait after committing a video track before warning that nothing has decoded.
