@@ -6,7 +6,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process::exit};
 
 use gst::prelude::*;
@@ -70,6 +70,18 @@ pub struct Args {
     #[clap(long, env = "WHEP_SRT_VIDEO_FPS", default_value_t = 25)]
     pub video_fps: u32,
 }
+
+/// Total budget for shutdown before exiting.
+///
+/// Setting the pipeline to NULL is what makes whepclientsrc issue the WHEP DELETE that releases the
+/// session on the manager, and that is an HTTP round trip. Exiting before it completes orphans the
+/// session: the bridge then lingers in the line's participant list until reconciliation expires it
+/// (~100s), showing up as the same bridge twice. This used to be a flat 1s sleep, which lost the
+/// race often enough to be noticed.
+///
+/// The gateway sends SIGINT and escalates to SIGKILL after 2s (whep-srt-gateway
+/// receiver.ts killProcess), so this has to stay comfortably under that.
+const SHUTDOWN_GRACE_MS: u64 = 1500;
 
 /// How long to wait after committing a video track before warning that nothing has decoded.
 /// Comfortably longer than a browser publisher's GOP, so a normal start stays quiet.
@@ -343,12 +355,32 @@ fn main() {
 
     let _ = ctrlc::set_handler(move || {
         info!("exit.. shutting down");
+        let started = Instant::now();
 
-        pipeline_clone
-            .set_state(gst::State::Null)
-            .expect("Unable to set the pipeline to the `Null` state");
+        // Not .expect(): a failed state change must not panic the shutdown path and leave the
+        // process to be SIGKILLed, which is the very thing that orphans the session.
+        if let Err(err) = pipeline_clone.set_state(gst::State::Null) {
+            warn!("could not set pipeline to NULL on shutdown: {err}");
+        }
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Block until the state change has actually completed rather than merely been requested:
+        // it is that teardown which sends the WHEP DELETE.
+        let grace = Duration::from_millis(SHUTDOWN_GRACE_MS);
+        let (result, current, _pending) =
+            pipeline_clone.state(gst::ClockTime::from_mseconds(SHUTDOWN_GRACE_MS));
+        info!(
+            "pipeline teardown finished in {}ms (result {:?}, state {:?})",
+            started.elapsed().as_millis(),
+            result,
+            current
+        );
+
+        // Spend whatever is left of the budget letting the DELETE reach the manager. Teardown
+        // returning does not prove the HTTP request completed, so the wait is not wasted.
+        let remaining = grace.saturating_sub(started.elapsed());
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
 
         exit(0);
     });
