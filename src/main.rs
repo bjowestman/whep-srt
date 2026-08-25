@@ -65,6 +65,23 @@ pub struct Args {
     #[clap(long, env = "WHEP_SRT_VIDEO_SIZE", default_value_t = String::from("1280x720"))]
     pub video_size: String,
 
+    /// Whether x264 uses sliced threads (used when --bridge-video is set).
+    ///
+    /// tune=zerolatency turns these on, which caps parallelism: measured on a 4-core host,
+    /// 1080p50 veryfast plateaued around 1.5 cores with 2.4 idle and could not keep up.
+    /// Setting this false lets x264 use frame threading instead — 1080p50 veryfast went from
+    /// 1.3x to 1.8x real time, and superfast to 2.3x, which is more headroom than the 720p50
+    /// configuration it replaces. The cost is roughly one frame of delay per thread, about 80 ms
+    /// at 50 fps, which is the very thing zerolatency exists to avoid — hence a choice, not a
+    /// new default.
+    #[clap(
+        long,
+        env = "WHEP_SRT_SLICED_THREADS",
+        action = clap::ArgAction::Set,
+        default_value_t = true
+    )]
+    pub sliced_threads: bool,
+
     /// SRT latency in milliseconds on the output leg — how long SRT holds packets to recover
     /// losses before giving up on them.
     ///
@@ -126,6 +143,7 @@ fn build_video_branch(
     preset: &str,
     bitrate: u32,
     key_int: u32,
+    sliced_threads: bool,
 ) -> String {
     format!(
         "videotestsrc name=videofill pattern=black is-live=true \
@@ -135,6 +153,7 @@ fn build_video_branch(
          ! videoconvert \
          ! video/x-raw,format=I420 \
          ! x264enc tune=zerolatency speed-preset={preset} bitrate={bitrate} key-int-max={key_int} \
+         sliced-threads={sliced_threads} \
          ! h264parse config-interval=-1 \
          ! video/x-h264,stream-format=byte-stream,alignment=au ! queue ! mux. "
     )
@@ -252,6 +271,7 @@ fn main() {
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
     let srt_latency = args.srt_latency;
+    let sliced_threads = args.sliced_threads;
     let (video_width, video_height) = parse_video_size(&args.video_size);
     let video_fps = args.video_fps.max(1);
     // Advertise this many kbps to the SFU as available downlink bandwidth, via RTCP REMB. Off
@@ -282,7 +302,8 @@ fn main() {
         info!(
             "video bridging enabled: {video_width}x{video_height}@{video_fps}, x264 \
              preset={video_preset}, bitrate={video_bitrate} kbps, \
-             key-int-max={video_key_int}, tune=zerolatency"
+             key-int-max={video_key_int}, tune=zerolatency, \
+             sliced-threads={sliced_threads}"
         );
     }
     info!("---");
@@ -331,6 +352,7 @@ fn main() {
             &video_preset,
             video_bitrate,
             video_key_int,
+            sliced_threads,
         )
     } else {
         String::new()
@@ -977,6 +999,8 @@ mod tests {
         assert_eq!(args.video_size, "1280x720");
         // Unchanged from the value this used to hard-code, so an upgrade is not a behaviour change.
         assert_eq!(args.srt_latency, 100);
+        // True keeps zerolatency's own threading, i.e. what this did before the flag existed.
+        assert!(args.sliced_threads);
     }
 
     #[test]
@@ -1005,7 +1029,7 @@ mod tests {
 
     #[test]
     fn video_branch_declares_video_before_the_real_source_arrives() {
-        let branch = build_video_branch(1280, 720, 25, "fast", 8000, 60);
+        let branch = build_video_branch(1280, 720, 25, "fast", 8000, 60, true);
         // A black fill feeding the compositor is what holds the video PID in the first PMT.
         assert!(branch.contains("videotestsrc name=videofill pattern=black is-live=true"));
         assert!(branch.contains("compositor name=comp"));
@@ -1016,6 +1040,7 @@ mod tests {
         assert!(branch.contains("width=1280,height=720,framerate=25/1"));
         // 4:2:0 is what downstream can actually decode; negotiation alone gives Y444.
         assert!(branch.contains("format=I420"));
+        assert!(branch.contains("sliced-threads=true"));
         assert!(branch.contains("speed-preset=fast"));
         assert!(branch.contains("bitrate=8000"));
         assert!(branch.contains("key-int-max=60"));
