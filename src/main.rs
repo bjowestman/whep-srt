@@ -96,6 +96,11 @@ const VIDEO_DECODE_WARN_AFTER: Duration = Duration::from_secs(10);
 /// Build the always-present video branch: a black fill into a compositor, then the H.264 encoder
 /// and the mpegtsmux video pad.
 ///
+/// The I420 capsfilter is not cosmetic. Left to negotiate, videotestsrc and compositor settle on
+/// Y444, x264 then emits High 4:4:4 Predictive, and almost nothing downstream decodes that —
+/// browsers, most decoders and compositing software handle 8-bit 4:2:0. The stream connects and
+/// renders nothing, which is a hard failure that looks like a network problem.
+///
 /// Present from startup so the streamheader PAT/PMT declares video in the very first packets. The
 /// real video pad arrives from WHEP seconds later; anything that reads the program map before then
 /// — an SRT ingest the bridge dials on start, a relay that latches streamheaders and never
@@ -116,6 +121,7 @@ fn build_video_branch(
          compositor name=comp background=black \
          ! video/x-raw,width={width},height={height},framerate={fps}/1 \
          ! videoconvert \
+         ! video/x-raw,format=I420 \
          ! x264enc tune=zerolatency speed-preset={preset} bitrate={bitrate} key-int-max={key_int} \
          ! h264parse config-interval=-1 \
          ! video/x-h264,stream-format=byte-stream,alignment=au ! queue ! mux. "
@@ -993,6 +999,8 @@ mod tests {
         assert!(branch.contains("x264enc"));
         assert!(branch.trim_end().ends_with("mux."));
         assert!(branch.contains("width=1280,height=720,framerate=25/1"));
+        // 4:2:0 is what downstream can actually decode; negotiation alone gives Y444.
+        assert!(branch.contains("format=I420"));
         assert!(branch.contains("speed-preset=fast"));
         assert!(branch.contains("bitrate=8000"));
         assert!(branch.contains("key-int-max=60"));
