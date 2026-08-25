@@ -67,7 +67,13 @@ pub struct Args {
 
     /// Output video framerate in frames per second (used when --bridge-video is set).  Fixed for
     /// the same reason as --video-size.
-    #[clap(long, env = "WHEP_SRT_VIDEO_FPS", default_value_t = 25)]
+    ///
+    /// Defaults to 50 because that is what a 50 Hz plant expects, and a mismatch is not a subtle
+    /// quality loss: compositing software rejects a 25 fps feed into a 50 fps project outright. A
+    /// wrong-but-quiet default costs more than a heavier correct one, so cheap cases opt down
+    /// rather than everyone opting up. Note a browser publisher typically sends 30, so 50 out means
+    /// frames duplicated unevenly — fine for a talking head, not a basis for judging fast motion.
+    #[clap(long, env = "WHEP_SRT_VIDEO_FPS", default_value_t = 50)]
     pub video_fps: u32,
 }
 
@@ -940,6 +946,17 @@ fn debug_pipeline(pipe: &gst::Bin, str: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_defaults_suit_a_50hz_plant() {
+        // The reason this is a test and not just a default: a 25 fps feed into a 50 fps project is
+        // rejected outright by compositing software, so silently drifting back to 25 would break
+        // the output rather than merely soften it.
+        let args = Args::parse_from(["whep-srt", "-i", "https://example.invalid/whep"]);
+
+        assert_eq!(args.video_fps, 50);
+        assert_eq!(args.video_size, "1280x720");
+    }
 
     #[test]
     fn parses_a_valid_size() {
