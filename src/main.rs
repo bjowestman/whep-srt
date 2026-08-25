@@ -65,6 +65,18 @@ pub struct Args {
     #[clap(long, env = "WHEP_SRT_VIDEO_SIZE", default_value_t = String::from("1280x720"))]
     pub video_size: String,
 
+    /// SRT latency in milliseconds on the output leg — how long SRT holds packets to recover
+    /// losses before giving up on them.
+    ///
+    /// This has to be a flag because a latency in the output URL does not reach srtsink: measured,
+    /// the element property beats the URI parameter, so the 100 ms this used to hard-code won
+    /// regardless of what an operator wrote. 100 ms is a tight window on a lossy path — at higher
+    /// bitrates there are more packets in flight, retransmits miss the deadline and the receiver
+    /// decodes with holes, which looks like corruption rather than loss. Raise it when the path
+    /// between bridge and ingest is not local.
+    #[clap(long, env = "WHEP_SRT_SRT_LATENCY", default_value_t = 100)]
+    pub srt_latency: u32,
+
     /// Output video framerate in frames per second (used when --bridge-video is set).  Fixed for
     /// the same reason as --video-size.
     ///
@@ -239,6 +251,7 @@ fn main() {
     let video_bitrate = args.video_bitrate;
     let video_preset = args.video_preset;
     let video_key_int = args.video_key_int;
+    let srt_latency = args.srt_latency;
     let (video_width, video_height) = parse_video_size(&args.video_size);
     let video_fps = args.video_fps.max(1);
     // Advertise this many kbps to the SFU as available downlink bandwidth, via RTCP REMB. Off
@@ -264,7 +277,7 @@ fn main() {
 
     gst::init().expect("Could not initiate GStreamer");
 
-    info!("SRT output at {output_url}");
+    info!("SRT output at {output_url} (srt latency {srt_latency} ms)");
     if bridge_video {
         info!(
             "video bridging enabled: {video_width}x{video_height}@{video_fps}, x264 \
@@ -326,7 +339,7 @@ fn main() {
     let pipeline_str = format!(
         "{input} audiotestsrc wave=silence is-live=true ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! {mixer} ! avenc_aac ! aacparse ! mux. \
         {video_branch}\
-        mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency=100"
+        mpegtsmux name=mux alignment=7 ! queue ! srtsink uri=\"{output_url}\" sync=false wait-for-connection=false latency={srt_latency}"
     );
 
     let mut context = gst::ParseContext::new();
@@ -962,6 +975,8 @@ mod tests {
 
         assert_eq!(args.video_fps, 50);
         assert_eq!(args.video_size, "1280x720");
+        // Unchanged from the value this used to hard-code, so an upgrade is not a behaviour change.
+        assert_eq!(args.srt_latency, 100);
     }
 
     #[test]
