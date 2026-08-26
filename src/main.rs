@@ -118,6 +118,9 @@ pub struct Args {
 /// whep-srt-gateway does so at 2s — so this has to stay comfortably under that.
 const SHUTDOWN_GRACE_MS: u64 = 1500;
 
+/// Name of the bus message the interrupt handler posts to wake the main loop.
+const SHUTDOWN_MESSAGE_NAME: &str = "whep-srt-shutdown";
+
 /// How long to wait after committing a video track before warning that nothing has decoded.
 /// Comfortably longer than a browser publisher's GOP, so a normal start stays quiet.
 const VIDEO_DECODE_WARN_AFTER: Duration = Duration::from_secs(10);
@@ -385,7 +388,6 @@ fn main() {
     let pipeline = pipeline
         .dynamic_cast::<gst::Pipeline>()
         .expect("could not cast pipeline");
-    let pipeline_clone = pipeline.clone();
 
     let mixer = pipeline
         .by_name("mixer")
@@ -400,39 +402,47 @@ fn main() {
         .by_name("input")
         .expect("could not get whep input bin");
 
-    let _ = ctrlc::set_handler(move || {
+    // The bus is taken before the handler is installed, because waking the main loop through it
+    // is now the handler's only job.
+    let bus = pipeline.bus().expect("pipeline has no bus");
+
+    // Shutdown runs on the main thread, not in here.
+    //
+    // Tearing the pipeline down from the handler's own thread raced the main loop: setting the
+    // pipeline to NULL flushes the bus, bus.iter_timed() then returns, main runs off the end of the
+    // function and the process exits — killing this thread part-way through, before the WHEP DELETE
+    // it was waiting for could land. Seen in production as a 183ms shutdown with no teardown log at
+    // all and a session the manager never heard about, so the budget added for exactly this problem
+    // never got to spend itself. The handler now posts a message and lets main own both teardown
+    // and exit; a second interrupt is taken as "stop waiting".
+    let shutdown_bus = bus.clone();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    if let Err(err) = ctrlc::set_handler(move || {
+        if shutdown_requested.swap(true, Ordering::AcqRel) {
+            warn!("second interrupt received, exiting without waiting for teardown");
+            exit(0);
+        }
         info!("exit.. shutting down");
-        let started = Instant::now();
 
-        // Not .expect(): a failed state change must not panic the shutdown path and leave the
-        // process to be SIGKILLed, which is the very thing that orphans the session.
-        if let Err(err) = pipeline_clone.set_state(gst::State::Null) {
-            warn!("could not set pipeline to NULL on shutdown: {err}");
+        // Posted while the pipeline is still PLAYING, so the bus is not yet flushing and the
+        // message is certain to be delivered.
+        if let Err(err) = shutdown_bus.post(gst::message::Application::new(
+            gst::Structure::new_empty(SHUTDOWN_MESSAGE_NAME),
+        )) {
+            // No way left to reach main, so exit here rather than hang until the gateway's SIGKILL.
+            error!("could not post the shutdown message to the bus: {err}");
+            exit(1);
         }
-
-        // Block until the state change has actually completed rather than merely been requested:
-        // it is that teardown which sends the WHEP DELETE.
-        let grace = Duration::from_millis(SHUTDOWN_GRACE_MS);
-        let (result, current, _pending) =
-            pipeline_clone.state(gst::ClockTime::from_mseconds(SHUTDOWN_GRACE_MS));
-        info!(
-            "pipeline teardown finished in {}ms (result {:?}, state {:?})",
-            started.elapsed().as_millis(),
-            result,
-            current
+    }) {
+        // Previously `let _ =`: a process with no signal handling at all looked identical to a
+        // healthy one, and every stop orphaned its WHEP session in silence.
+        error!(
+            "could not install the interrupt handler, so shutdown will not release the WHEP \
+             session on the manager: {err}"
         );
-
-        // Spend whatever is left of the budget letting the DELETE reach the manager. Teardown
-        // returning does not prove the HTTP request completed, so the wait is not wasted.
-        let remaining = grace.saturating_sub(started.elapsed());
-        if !remaining.is_zero() {
-            std::thread::sleep(remaining);
-        }
-
-        exit(0);
-    });
-
-    let bus = pipeline.bus().unwrap();
+    } else {
+        info!("interrupt handler installed (shutdown budget {SHUTDOWN_GRACE_MS}ms)");
+    }
 
     let pipeline_clone = pipeline.clone();
 
@@ -936,6 +946,14 @@ fn main() {
                     debug_pipeline(pipe_bin, &format!("{:?}", state.current()));
                 }
             }
+            MessageView::Application(app) => {
+                if app
+                    .structure()
+                    .is_some_and(|st| st.name().as_str() == SHUTDOWN_MESSAGE_NAME)
+                {
+                    break;
+                }
+            }
             MessageView::Eos(..) => break,
             MessageView::Error(err) => {
                 error!(
@@ -956,11 +974,35 @@ fn main() {
         }
     }
 
-    pipeline
-        .set_state(gst::State::Null)
-        .expect("Unable to set the pipeline to the `Null` state");
+    // Teardown is what makes whepclientsrc issue the WHEP DELETE that releases the session on the
+    // manager. Without it the bridge stays in the line's participant list until reconciliation
+    // expires it roughly 100s later, which is why a stop/start showed the same bridge twice.
+    let started = Instant::now();
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Not .expect(): panicking here would abort the process before the DELETE could land, which is
+    // the very thing this path exists to prevent.
+    if let Err(err) = pipeline.set_state(gst::State::Null) {
+        warn!("could not set pipeline to NULL on shutdown: {err}");
+    }
+
+    // Block until the state change has actually completed rather than merely been requested: it is
+    // that teardown which sends the DELETE.
+    let grace = Duration::from_millis(SHUTDOWN_GRACE_MS);
+    let (result, current, _pending) =
+        pipeline.state(gst::ClockTime::from_mseconds(SHUTDOWN_GRACE_MS));
+    info!(
+        "pipeline teardown finished in {}ms (result {:?}, state {:?})",
+        started.elapsed().as_millis(),
+        result,
+        current
+    );
+
+    // Spend whatever is left of the budget letting the DELETE reach the manager. Teardown returning
+    // does not prove the HTTP request completed, so the wait is not wasted.
+    let remaining = grace.saturating_sub(started.elapsed());
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining);
+    }
 }
 
 fn debug_pipeline(pipe: &gst::Bin, str: &str) {
