@@ -1,0 +1,14 @@
+# Host build artefacts must not enter the build context. Beyond the obvious cost of copying a
+# multi-gigabyte directory, a target/ carried in from the host can leave cargo looking at artefacts
+# it believes are current and skipping the recompile — a build that silently produces the previous
+# binary, which is far worse than a slow one.
+target/
+
+# Nothing in the build needs history, and it changes on every commit, so including it would
+# invalidate the context layer for no reason.
+.git/
+.gitignore
+.dockerignore
+
+# The image is built from this file; it is not an input to the compile.
+Dockerfile
