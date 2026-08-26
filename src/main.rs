@@ -974,20 +974,57 @@ fn main() {
         }
     }
 
-    // Teardown is what makes whepclientsrc issue the WHEP DELETE that releases the session on the
-    // manager. Without it the bridge stays in the line's participant list until reconciliation
-    // expires it roughly 100s later, which is why a stop/start showed the same bridge twice.
+    // Shutdown, in the order that survives the sink aborting.
+    //
+    // Taking the whole pipeline to NULL walks srtsink through PLAYING -> PAUSED, where it cancels
+    // the DNS resolution for its host and trips a GLib threaded-resolver assertion that calls
+    // g_error() — the process aborts outright, mid-teardown (GStreamer issue #3946). Measured on
+    // dev: SIGABRT about 200ms after the interrupt, before the WHEP DELETE could reach the manager,
+    // which then kept the bridge in the line's participant list until reconciliation expired it
+    // roughly 100s later. That is the bridge appearing twice after a stop/start.
+    //
+    // So the session is released first and the budget is spent before anything risky is touched.
+    // Whether the sink then tears down cleanly or aborts, the part that matters has already
+    // happened. Note this only bites on a hostname: an SRT URL with a literal IP needs no resolver.
     let started = Instant::now();
+    let grace = Duration::from_millis(SHUTDOWN_GRACE_MS);
 
-    // Not .expect(): panicking here would abort the process before the DELETE could land, which is
-    // the very thing this path exists to prevent.
+    // Setting the WHEP source to NULL is what makes whepclientsrc issue the DELETE that releases
+    // the session. Done on the source alone rather than the pipeline, so it does not depend on the
+    // rest of the graph tearing down first.
+    match pipeline.by_name("input") {
+        Some(input) => {
+            // Not .expect(): panicking here would abort before the DELETE could land, which is the
+            // very thing this ordering exists to prevent.
+            if let Err(err) = input.set_state(gst::State::Null) {
+                warn!("could not set the WHEP source to NULL on shutdown: {err}");
+            }
+            let (result, current, _pending) =
+                input.state(gst::ClockTime::from_mseconds(SHUTDOWN_GRACE_MS));
+            info!(
+                "WHEP source released in {}ms (result {:?}, state {:?})",
+                started.elapsed().as_millis(),
+                result,
+                current
+            );
+        }
+        // Should not happen — the element is named in the pipeline string — but a shutdown that
+        // cannot find it must say so rather than silently release nothing.
+        None => warn!("no element named 'input' found, WHEP session not released"),
+    }
+
+    // Spend whatever is left of the budget here, before the part that can abort. A state change
+    // completing does not prove the HTTP request did, so the wait is not wasted.
+    let remaining = grace.saturating_sub(started.elapsed());
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining);
+    }
+
+    // Everything that matters is done. If the known srtsink bug fires, it fires here.
+    info!("releasing the pipeline (an srtsink/GLib bug can abort the process at this point)");
     if let Err(err) = pipeline.set_state(gst::State::Null) {
         warn!("could not set pipeline to NULL on shutdown: {err}");
     }
-
-    // Block until the state change has actually completed rather than merely been requested: it is
-    // that teardown which sends the DELETE.
-    let grace = Duration::from_millis(SHUTDOWN_GRACE_MS);
     let (result, current, _pending) =
         pipeline.state(gst::ClockTime::from_mseconds(SHUTDOWN_GRACE_MS));
     info!(
@@ -996,13 +1033,6 @@ fn main() {
         result,
         current
     );
-
-    // Spend whatever is left of the budget letting the DELETE reach the manager. Teardown returning
-    // does not prove the HTTP request completed, so the wait is not wasted.
-    let remaining = grace.saturating_sub(started.elapsed());
-    if !remaining.is_zero() {
-        std::thread::sleep(remaining);
-    }
 }
 
 fn debug_pipeline(pipe: &gst::Bin, str: &str) {
